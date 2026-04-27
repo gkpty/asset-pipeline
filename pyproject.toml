@@ -1,0 +1,36 @@
+[project]
+name = "asset-pipeline-workspace"
+version = "0.1.0"
+description = "Monorepo root for the asset optimization pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "asset-cli",
+]
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/cli", "apps/api"]
+
+[tool.uv.sources]
+asset-db  = { workspace = true }
+asset-sdk = { workspace = true }
+asset-cli = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["packages", "apps"]

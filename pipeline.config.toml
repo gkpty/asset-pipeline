@@ -1,0 +1,104 @@
+# Asset Pipeline configuration
+# This file holds project-wide standards that the diagnose and remediate stages enforce.
+
+[source]
+adapter = "google_drive"
+# Drive folder ID is read from GOOGLE_DRIVE_ROOT_FOLDER_ID env var.
+
+[destination]
+adapter = "s3"
+# Bucket and prefix are read from env vars S3_BUCKET / S3_PREFIX.
+
+[csv]
+adapter = "google_sheets"
+# Sheet ID is read from GOOGLE_SHEETS_MASTER_ID env var.
+tab_name               = "products"
+sku_column             = "sku"
+name_column            = "name"
+supplier_column        = "supplier"
+parent_product_column  = "parent product"
+
+[drive]
+# "supplier" → root / supplier / sku  (default)
+# "flat"     → root / sku
+structure = "supplier"
+
+[diagnose]
+report_tab = "Diagnose Report"
+
+[lifestyle]
+report_tab = "Lifestyle Rename"
+
+[models]
+report_tab = "Models Report"
+
+[paths]
+# Subfolder convention inside each SKU directory.
+[paths.input]
+product_photos        = "photos"
+lifestyle_photos      = "lifestyle"
+thumbnails_website    = "thumbnails/website_thumbnail"
+thumbnails_system     = "thumbnails/system_thumbnail"
+videos                = "videos"
+diagram               = "diagram"
+models_dwg            = "models/dwg"
+models_obj            = "models/obj"
+models_gltf           = "models/gltf"
+models_skp            = "models/skp"
+assembly_instructions = "assembly_instructions"
+carton_layout         = "carton_layout"
+barcode               = "barcode"
+
+# --- Diagnostics, keyed by asset kind ---
+
+[diagnostics.product_photo]
+required_format = "jpg"
+min_width = 1200
+max_width = 4000
+min_height = 1200
+max_height = 4000
+aspect_ratio = "1:1"
+aspect_tolerance = 0.02
+require_white_background = true
+white_threshold = 245       # RGB value above which a pixel counts as "white"
+white_min_pct = 0.85        # min % of pixels above threshold to pass
+target_padding_pct = 8      # uniform padding around the subject as % of canvas
+padding_tolerance_pct = 2
+min_count_per_entity = 4
+
+[diagnostics.lifestyle_photo]
+required_format = "jpg"
+min_width = 1500
+min_count_per_entity = 0
+
+[diagnostics.video]
+allowed_formats = ["mp4", "mov"]
+
+[diagnostics.diagram]
+allowed_formats = ["pdf"]
+
+[diagnostics.assembly_instructions]
+allowed_formats = ["pdf"]
+
+# --- Derive (deferred to v2; configured for forward compatibility) ---
+
+[derive.thumbnails.website]
+width = 600
+height = 600
+format = "jpg"
+quality = 85
+
+[derive.thumbnails.system]
+width = 120
+height = 120
+format = "jpg"
+quality = 80
+
+[derive.barcode]
+format = "code128"
+include_text = true
+
+[derive.catalog]
+page_size = "letter"
+products_per_page = 4
+cmyk_variant = true
