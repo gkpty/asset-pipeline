@@ -12,6 +12,7 @@ class CsvConfig:
     name_column:            str = "name"
     supplier_column:        str = "supplier"
     parent_product_column:  str = "parent product"
+    supplier_ref_column:    str = "supplier ref"
 
 
 @dataclass
@@ -33,6 +34,36 @@ class LifestyleConfig:
 @dataclass
 class ModelsConfig:
     report_tab: str = "Models Report"
+
+
+@dataclass
+class ScaffoldConfig:
+    report_tab:         str = "Scaffold Report"
+    moved_folder_name:  str = "MOVED_FOLDER"
+    typo_cutoff:        float = 0.65
+
+
+@dataclass
+class OptimizeConfig:
+    # Photo settings
+    target_size:           int   = 2000
+    target_padding_pct:    float = 8.0
+    white_threshold:       int   = 245
+    jpg_quality:           int   = 85
+    max_file_mb:           float = 2.0
+    output_subdir_suffix:  str   = "_optimized"
+    report_tab:            str   = "Optimize Report"
+
+    # Model settings
+    model_dest_subdir:        str   = "models_optimized"
+    model_target_texture_px:  int   = 1024
+    model_decim_target_fine:  float = 0.25   # retention for finely-tessellated meshes
+    model_decim_target_med:   float = 0.55   # retention for moderate density
+    model_decim_target_coarse: float = 0.85  # retention for already-coarse meshes
+    model_decim_max_stretch:  float = 0.10   # reject if longest output edge > this × bbox diag
+    model_unit_name:          str   = "millimeter"
+    model_unit_meter:         float = 0.001
+    model_up_axis:            str   = "Z_UP"
 
 
 @dataclass
@@ -83,6 +114,8 @@ class PipelineConfig:
     diagnose:  DiagnoseConfig  = field(default_factory=DiagnoseConfig)
     lifestyle: LifestyleConfig = field(default_factory=LifestyleConfig)
     models:    ModelsConfig    = field(default_factory=ModelsConfig)
+    scaffold:  ScaffoldConfig  = field(default_factory=ScaffoldConfig)
+    optimize:  OptimizeConfig  = field(default_factory=OptimizeConfig)
     paths:     InputPaths      = field(default_factory=InputPaths)
 
     @classmethod
@@ -100,5 +133,7 @@ class PipelineConfig:
             diagnose=_build(DiagnoseConfig, raw.get("diagnose", {})),
             lifestyle=_build(LifestyleConfig, raw.get("lifestyle", {})),
             models=_build(ModelsConfig, raw.get("models", {})),
+            scaffold=_build(ScaffoldConfig, raw.get("scaffold", {})),
+            optimize=_build(OptimizeConfig, raw.get("optimize", {})),
             paths=_build(InputPaths, raw.get("paths", {}).get("input", {})),
         )

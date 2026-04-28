@@ -17,6 +17,7 @@ sku_column             = "sku"
 name_column            = "name"
 supplier_column        = "supplier"
 parent_product_column  = "parent product"
+supplier_ref_column = "supplier ref"
 
 [drive]
 # "supplier" → root / supplier / sku  (default)
@@ -31,6 +32,32 @@ report_tab = "Lifestyle Rename"
 
 [models]
 report_tab = "Models Report"
+
+[scaffold]
+report_tab        = "Scaffold Report"
+moved_folder_name = "MOVED_FOLDER"
+typo_cutoff       = 0.65          # difflib similarity above which a folder name is treated as a typo
+
+[optimize]
+# --- Photo settings ---
+target_size           = 2000   # final canvas is target_size × target_size
+target_padding_pct    = 8      # padding around the detected product, % of canvas
+white_threshold       = 245    # RGB ≥ this counts as background and gets clamped to pure white
+jpg_quality           = 85     # initial JPEG quality (auto-drops if max_file_mb is exceeded)
+max_file_mb           = 2.0    # drop quality until file fits under this
+output_subdir_suffix  = "_optimized"
+report_tab            = "Optimize Report"
+
+# --- Model settings ---
+model_dest_subdir         = "models_optimized"
+model_target_texture_px   = 1024  # textures are downscaled if longer edge exceeds this
+model_decim_target_fine   = 0.25  # retention for finely-tessellated meshes
+model_decim_target_med    = 0.55  # retention for moderate density
+model_decim_target_coarse = 0.85  # retention for already-coarse meshes
+model_decim_max_stretch   = 0.10  # reject decimation if longest output edge > this × bbox diag
+model_unit_name           = "millimeter"
+model_unit_meter          = 0.001
+model_up_axis             = "Z_UP"
 
 [paths]
 # Subfolder convention inside each SKU directory.

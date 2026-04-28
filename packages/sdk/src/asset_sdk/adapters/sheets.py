@@ -25,8 +25,14 @@ def write_report(
     tab: str,
     headers: list[str],
     rows: list[list],
+    value_input_option: str = "RAW",
 ) -> None:
-    """Write *headers* + *rows* to *tab*, creating the tab if needed."""
+    """Write *headers* + *rows* to *tab*, creating the tab if needed.
+
+    value_input_option:
+      "RAW"          — values written as-is (default; safe for arbitrary text)
+      "USER_ENTERED" — values parsed by Sheets (formulas like =IMAGE(...) evaluated)
+    """
     gc = _client()
     ss = gc.open_by_key(sheet_id)
     try:
@@ -34,4 +40,4 @@ def write_report(
         ws.clear()
     except gspread.exceptions.WorksheetNotFound:
         ws = ss.add_worksheet(title=tab, rows=max(len(rows) + 20, 100), cols=len(headers))
-    ws.update([headers, *rows])
+    ws.update([headers, *rows], value_input_option=value_input_option)

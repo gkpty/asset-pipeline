@@ -1,6 +1,6 @@
 # Asset Optimization Pipeline
 
-A local, single-user pipeline for managing and optimizing product assets. It reads a master product list from Google Sheets, audits asset folders in Google Drive, applies bulk fixes, and publishes canonical files to S3.
+A local, single-user pipeline for managing and optimizing product assets. It reads a master product list from Google Sheets, audits asset folders in Google Drive, applies bulk fixes, optimizes photos and 3D models, and produces a clean canonical structure ready for downstream publishing.
 
 ---
 
@@ -13,18 +13,13 @@ A local, single-user pipeline for managing and optimizing product assets. It rea
 - [Configuration](#configuration)
   - [Environment variables](#environment-variables)
   - [Pipeline config](#pipeline-config)
-  - [Google service account](#google-service-account)
+  - [Google OAuth setup](#google-oauth-setup)
 - [Google Drive folder structure](#google-drive-folder-structure)
+- [Pipeline workflow](#pipeline-workflow)
 - [CLI reference](#cli-reference)
-  - [`asset init`](#asset-init)
-  - [`asset diagnose`](#asset-diagnose)
-  - [`asset rename-lifestyle-photos`](#asset-rename-lifestyle-photos)
-- [Pipeline stages](#pipeline-stages)
+- [Image optimization details](#image-optimization-details)
+- [3D model optimization details](#3d-model-optimization-details)
 - [Development](#development)
-  - [Project layout](#project-layout)
-  - [Common make targets](#common-make-targets)
-  - [Running tests](#running-tests)
-  - [Adding a migration](#adding-a-migration)
 
 ---
 
@@ -34,10 +29,12 @@ The pipeline works against two sources of truth:
 
 | Source | What it owns |
 |--------|-------------|
-| **Google Sheets** | Which products exist (SKUs, suppliers, metadata) |
+| **Google Sheets** | Which products exist (SKUs, suppliers, product names, parent products, supplier refs) |
 | **Google Drive** | Which asset files exist and their folder structure |
 
-A typical run moves through several stages — pulling the product list, scanning Drive, diagnosing problems, applying fixes, and publishing — each of which can be run independently from the CLI.
+A typical run moves through several stages — diagnosing structure problems, renaming orphans against the sheet, removing duplicates, scaffolding missing folders, uploading any missing local files, generating derived assets, organizing for publish, and finally optimizing photos and 3D models. Each stage is its own CLI command and is independently re-runnable.
+
+Reports are always written to a Google Sheets tab so they can be edited in place. Several commands (`rename`, `dedupe`) read the diagnose report's edited columns directly, making the sheet the source of truth for in-flight decisions.
 
 ---
 
@@ -46,13 +43,13 @@ A typical run moves through several stages — pulling the product list, scannin
 ```
 asset_pipeline/
 ├── packages/
-│   ├── db/       Python package — SQLAlchemy models + Alembic migrations
-│   └── sdk/      Python package — storage adapters, stage logic, config
+│   ├── db/       Python — SQLAlchemy models + Alembic migrations (Postgres 16)
+│   └── sdk/      Python — storage adapters, stage logic, config, image/3D pipelines
 ├── apps/
 │   ├── cli/      Typer CLI  (entry point: `asset`)
 │   ├── api/      FastAPI service  (read-only views, v2)
 │   └── web/      Next.js 15 front-end  (v2)
-├── pipeline.config.toml   Per-project standards (folder names, image rules)
+├── pipeline.config.toml   Per-project standards (folder names, optimize settings)
 └── docker-compose.yml     Local Postgres 16
 ```
 
@@ -76,69 +73,45 @@ Python packages are tied together with a **uv workspace**. The JS app is managed
 
 ### 1. Install uv
 
-uv is the Python package manager used by this project.
-
 ```bash
-# macOS / Linux (recommended)
+# macOS / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # macOS via Homebrew
 brew install uv
 ```
 
-After installing, reload your shell:
+Reload your shell, then verify:
 
 ```bash
-source ~/.zshrc   # or ~/.bashrc / ~/.bash_profile depending on your shell
-```
-
-Verify:
-
-```bash
+source ~/.zshrc
 uv --version
 ```
 
 ### 2. Install pnpm
 
-pnpm manages the Node.js dependencies (web app).
-
 ```bash
-# macOS / Linux
 curl -fsSL https://get.pnpm.io/install.sh | sh
-
-# macOS via Homebrew
-brew install pnpm
-
-# via npm (if you already have Node)
-npm install -g pnpm
-```
-
-Verify:
-
-```bash
+# or: brew install pnpm
+# or: npm install -g pnpm
 pnpm --version
 ```
 
-### 3. Clone and set up the project
+### 3. Set up the project
 
 ```bash
-# Clone the repo
 git clone <repo-url>
 cd asset_pipeline
 
-# Copy and fill in the environment file
 cp env.example .env
-# Edit .env — see the Configuration section below for required values.
+# Edit .env — see Configuration below.
 
-# Install all Python and JS dependencies
-make install
-
-# Start Postgres and run migrations
-make up
-make migrate
+make install            # uv sync + pnpm install
+make up                 # start Postgres in Docker
+make migrate            # apply Alembic migrations
 ```
 
-After `make install` the `asset` CLI is available inside the uv environment:
+The `asset` CLI is now available:
 
 ```bash
 uv run asset --help
@@ -155,41 +128,39 @@ Copy `env.example` to `.env` and fill in the values. The file is gitignored.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DATABASE_URL` | Yes | Postgres connection string. Defaults to the local Docker instance. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Yes | Path to a Google service account JSON key file (see [Google service account](#google-service-account)). |
-| `GOOGLE_SHEETS_MASTER_ID` | Yes | ID of the Google Sheet that holds the master product list. Found in the sheet URL: `https://docs.google.com/spreadsheets/d/**<ID>**/`. |
-| `GOOGLE_DRIVE_ROOT_FOLDER_ID` | Yes | ID of the Google Drive folder that contains all SKU folders. Found in the folder URL: `https://drive.google.com/drive/folders/**<ID>**`. |
-| `GOOGLE_DRIVE_LIFESTYLE_FOLDER_ID` | For `rename-lifestyle-photos` | ID of the Google Drive folder containing the lifestyle photo folders (named by parent product). |
-| `GOOGLE_SHEETS_RANGE` | No | Default read range, e.g. `Products!A1:Z10000`. |
-| `AWS_REGION` | No | AWS region for S3 publishing (used in future stages). |
-| `AWS_ACCESS_KEY_ID` | No | AWS credentials for S3. |
-| `AWS_SECRET_ACCESS_KEY` | No | AWS credentials for S3. |
-| `S3_BUCKET` | No | Destination S3 bucket. |
-| `S3_PREFIX` | No | Key prefix inside the bucket. |
+| `GOOGLE_OAUTH_CREDENTIALS` | Yes | Path to the OAuth Desktop-app client JSON downloaded from Google Cloud Console. See [Google OAuth setup](#google-oauth-setup). |
+| `GOOGLE_OAUTH_TOKEN_PATH` | No | Where the refreshable user token is cached. Defaults to `./.secrets/oauth_token.json`. |
+| `GOOGLE_SHEETS_MASTER_ID` | Yes | ID of the Google Sheet that holds the master product list. From the sheet URL: `https://docs.google.com/spreadsheets/d/**<ID>**/`. |
+| `GOOGLE_DRIVE_ROOT_FOLDER_ID` | Yes | ID of the Google Drive folder that contains all SKU folders. From the folder URL: `https://drive.google.com/drive/folders/**<ID>**`. |
+| `GOOGLE_DRIVE_LIFESTYLE_FOLDER_ID` | For `rename-lifestyle-photos` | Drive folder containing lifestyle photo folders (named by parent product). |
+| `GOOGLE_DRIVE_MODELS_FOLDER_ID` | For `copy-models-into-products` | Shared Drive folder containing per-SKU model folders. |
 | `PIPELINE_CONFIG_PATH` | No | Path to `pipeline.config.toml`. Defaults to `./pipeline.config.toml`. |
-| `LOG_LEVEL` | No | `INFO` (default), `DEBUG`, `WARNING`, etc. |
+| `AWS_REGION` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `S3_BUCKET` / `S3_PREFIX` | For S3 publishing (v2) | AWS credentials and destination. |
+| `LOG_LEVEL` | No | `INFO` (default), `DEBUG`, etc. |
 
 ### Pipeline config
 
-`pipeline.config.toml` controls the folder naming convention and per-kind quality standards used by the diagnose and remediate stages.
+`pipeline.config.toml` controls folder naming conventions, sheet column headers, and per-command tuning knobs. Defaults are sensible — you usually only edit `[csv]` (sheet column headers) and `[paths.input]` (Drive subfolder names) when adapting to a new project.
+
+Key sections:
 
 ```toml
 [csv]
-tab_name        = "products"       # sheet tab that contains the SKU list
-sku_column      = "sku"            # column A header
-supplier_column = "supplier"       # column E header
+tab_name              = "products"
+sku_column            = "sku"
+name_column           = "name"
+supplier_column       = "supplier"
+parent_product_column = "parent product"
+supplier_ref_column   = "supplier ref"
 
 [drive]
 # "supplier" → root / <supplier> / <sku>   (default)
 # "flat"     → root / <sku>
 structure = "supplier"
 
-[diagnose]
-report_tab = "Diagnose Report"     # tab written back to the sheet
-
 [paths.input]
-# Subfolder names expected inside every SKU folder in Google Drive.
-product_photos        = "product_photos"
-lifestyle_photos      = "lifestyle_photos"
+product_photos        = "photos"
+lifestyle_photos      = "lifestyle"
 thumbnails_website    = "thumbnails/website_thumbnail"
 thumbnails_system     = "thumbnails/system_thumbnail"
 videos                = "videos"
@@ -201,111 +172,100 @@ models_skp            = "models/skp"
 assembly_instructions = "assembly_instructions"
 carton_layout         = "carton_layout"
 barcode               = "barcode"
+
+[diagnose]   report_tab = "Diagnose Report"
+[lifestyle]  report_tab = "Lifestyle Rename"
+[models]     report_tab = "Models Report"
+
+[scaffold]
+report_tab        = "Scaffold Report"
+moved_folder_name = "MOVED_FOLDER"
+typo_cutoff       = 0.65
+
+[optimize]
+# Photos
+target_size           = 2000
+target_padding_pct    = 8
+white_threshold       = 245
+jpg_quality           = 85
+max_file_mb           = 2.0
+output_subdir_suffix  = "_optimized"
+report_tab            = "Optimize Report"
+
+# 3D models
+model_dest_subdir         = "models_optimized"
+model_target_texture_px   = 1024
+model_decim_target_fine   = 0.25
+model_decim_target_med    = 0.55
+model_decim_target_coarse = 0.85
+model_decim_max_stretch   = 0.10
+model_unit_name           = "millimeter"
+model_unit_meter          = 0.001
+model_up_axis             = "Z_UP"
 ```
 
-To rename a folder, update the value here — no code changes needed.
+### Google OAuth setup
 
-### Google service account
-
-The pipeline authenticates to Google using a **service account** — a bot identity that can be granted access to specific Sheets and Drive folders without using your personal Google account.
+The pipeline authenticates to Google as **you** using OAuth (Desktop-app flow). Files created or modified by the CLI are owned by your Google account, which means the regular My Drive quota applies and there's no need for a Shared Drive. The first run opens a browser tab to authorize; the refresh token is then cached so subsequent runs are silent.
 
 #### Step 1 — Create a Google Cloud project (skip if you already have one)
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com/).
-2. Click the project dropdown at the top → **New Project**.
-3. Give it a name (e.g. `asset-pipeline`) and click **Create**.
+2. Click the project dropdown → **New Project** → name it (e.g. `asset-pipeline`) → **Create**.
 
 #### Step 2 — Enable the required APIs
 
-1. In the left sidebar go to **APIs & Services → Library**.
-2. Search for and enable each of these:
-   - **Google Sheets API**
-   - **Google Drive API**
+In the left sidebar go to **APIs & Services → Library** and enable:
 
-#### Step 3 — Create a service account
+- **Google Sheets API**
+- **Google Drive API**
 
-1. In the left sidebar go to **APIs & Services → Credentials**.
-2. Click **+ Create credentials** at the top and choose **Service account** from the dropdown.
+#### Step 3 — Configure the OAuth consent screen
 
-![Create credentials dropdown](readme-screenshots/01-create-credentials.png)
+1. **APIs & Services → OAuth consent screen**.
+2. User type: **External**, click **Create**.
+3. Fill in app name (e.g. `Asset Pipeline`), support email, developer email → **Save and continue** through the rest of the wizard.
+4. Under **Test users**, add your own Google email so you can log in while the app is in "Testing" mode.
 
-3. Fill in a name (e.g. `asset-pipeline`) and click **Create and continue**.
-4. On the **Permissions** step, set the role to **Owner** and click **Continue**.
+#### Step 4 — Create the OAuth client
 
-![Permissions step](readme-screenshots/02-permissions.png)
+1. **APIs & Services → Credentials → + Create credentials → OAuth client ID**.
+2. **Application type: Desktop app**, give it a name → **Create**.
+3. Click **Download JSON** on the new credential.
+4. Save it as `.secrets/oauth_client.json` in the project root (gitignored).
 
-5. Skip the **Principals with access** step and click **Done**.
+#### Step 5 — Share the resources with your Google account
 
-#### Step 4 — Generate a JSON key
+Make sure your Google account (the one you'll authorize with) has at least **Editor** access on:
 
-1. On the Credentials page, find your new service account under the **Service Accounts** section and click on it.
-2. Go to the **Keys** tab → **Add key → Create new key**.
-3. Select **JSON** (recommended) and click **Create**.
+- The master Google Sheet
+- The products Drive folder (`GOOGLE_DRIVE_ROOT_FOLDER_ID`)
+- The lifestyle / models folders, if you'll use those commands
 
-![Create private key dialog](readme-screenshots/03-create-key.png)
+If you own the resources, you already have access.
 
-4. The JSON key file downloads automatically to your computer.
-
-#### Step 5 — Save the key to the project
-
-```bash
-mkdir -p .secrets
-mv ~/Downloads/<your-key-file>.json .secrets/google-service-account.json
-```
-
-The `.secrets/` directory is gitignored — the key will never be committed.
-
-#### Step 6 — Share access with the service account
-
-The service account has an email address that looks like:
-
-```
-asset-pipeline@<your-project-id>.iam.gserviceaccount.com
-```
-
-You can find it on the Credentials page under **Service Accounts**.
-
-Share the following resources with that email:
-
-| Resource | Access level | Why |
-|----------|-------------|-----|
-| Your Google Sheet | **Editor** | The pipeline writes report tabs back to the sheet |
-| Your Google Drive root folder | **Viewer** | The pipeline lists folders and counts files |
-
-To share the Sheet: open it → click **Share** → paste the service account email → set role to Editor.
-
-To share the Drive folder: right-click the folder in Drive → **Share** → paste the email → set role to Viewer.
-
-#### Step 7 — Configure `.env`
-
-Make sure your `.env` contains:
-
-```bash
-GOOGLE_APPLICATION_CREDENTIALS=./.secrets/google-service-account.json
-GOOGLE_SHEETS_MASTER_ID=<your-sheet-id>
-GOOGLE_DRIVE_ROOT_FOLDER_ID=<your-drive-folder-id>
-```
-
-#### Step 8 — Verify
+#### Step 6 — First run
 
 ```bash
 uv run asset init
 ```
 
-You should see a green checkmark for both the Sheet and the Drive folder.
+A browser tab opens asking you to log in and approve the requested scopes (Drive + Sheets read/write). After you click **Allow**, the token is written to `.secrets/oauth_token.json` and every subsequent run is silent. The token auto-refreshes whenever it expires.
+
+To re-authenticate (e.g. switch accounts), delete `.secrets/oauth_token.json` and run `asset init` again.
 
 ---
 
 ## Google Drive folder structure
 
-The pipeline expects the Drive root folder (set via `GOOGLE_DRIVE_ROOT_FOLDER_ID`) to be organised by supplier, with one subfolder per supplier and one subfolder per SKU inside each supplier:
+The pipeline expects the products root to be organised by supplier:
 
 ```
 <Drive root folder>/
 └── <Supplier>/
     └── <SKU>/
-        ├── product_photos/
-        ├── lifestyle_photos/
+        ├── photos/
+        ├── lifestyle/
         ├── thumbnails/
         │   ├── website_thumbnail/
         │   └── system_thumbnail/
@@ -321,223 +281,375 @@ The pipeline expects the Drive root folder (set via `GOOGLE_DRIVE_ROOT_FOLDER_ID
         └── barcode/
 ```
 
-SKU folder names must match the SKU values in the master Google Sheet exactly. The subfolder names are configured in `pipeline.config.toml` and can be changed there without touching any code.
+Use `[drive] structure = "flat"` if your layout has SKUs directly under the root (no supplier level).
+
+The `scaffold` command will create any missing folders (and create missing SKU folders from the sheet). Subfolder names come from `[paths.input]` and can be renamed there without changing any code.
+
+---
+
+## Pipeline workflow
+
+The recommended order for a clean run from scratch:
+
+```
+ ┌──────────┐    ┌────────┐    ┌────────┐    ┌──────────┐
+ │ Diagnose │ -> │ Rename │ -> │ Dedupe │ -> │ Scaffold │
+ └──────────┘    └────────┘    └────────┘    └──────────┘
+                                                  │
+                                                  v
+                            ┌──────────────┐    ┌──────────────────┐
+                            │  Optimize    │ <- │ Upload missing   │
+                            │  (photos +   │    │ files            │
+                            │   models)    │    └──────────────────┘
+                            └──────────────┘
+```
+
+The full intended order is:
+
+| # | Stage | Command | Status | What it does |
+|---|---|---|---|---|
+| 1 | **Diagnose** | `asset diagnose` | available | Audit Drive vs sheet, write report with `Suggested Rename` (orphans) and `Suggested Action` (duplicates) columns |
+| 2 | **Rename** | `asset rename` | available | Apply the report's `Suggested Rename` column to rename orphan folders to their canonical SKU names |
+| 3 | **Deduplicate** | `asset dedupe` | available | Apply the report's `Suggested Action` column — DELETE redundant duplicates, MERGE folders with unique content |
+| 4 | **Scaffold** | `asset scaffold [--fix] [--clean] [--move]` | available | Create missing SKUs from sheet, ensure canonical subdir structure, fix loose files / typos, clean junk |
+| 5 | **Upload missing files** | `asset upload-local-files --type X --input ./dir` | available | Match local files to SKUs (filename / supplier ref / name / PDF content / fuzzy) and upload to the right subdir |
+| 6 | **Generate** | — | planned | Generate derived assets (thumbnails, barcodes, system thumbnails, PDF catalog) |
+| 7 | **Organize** | — | planned | Enumerate and rename within each SKU's subfolders to the canonical numbering scheme |
+| 8 | **Optimize** | `asset optimize --type {photo, model}` | available | Standardise photos (format/dimensions/padding/background/file size); decimate + re-export 3D models as OBJ/GLB/DAE |
+
+> **Re-run `diagnose` between stages.** Almost every other command operates on the diagnose report or on the live Drive structure, so refreshing the report after each step keeps decisions accurate.
+
+Special-purpose commands (run as needed, not part of the linear pipeline):
+
+| Command | Purpose |
+|---|---|
+| `asset rename-lifestyle-photos` | Map a separate "lifestyle photos" folder (named by parent product) into each SKU's `lifestyle/` subdir |
+| `asset copy-models-into-products` | Pull a shared 3D models folder into each SKU's `models/<type>/` and `diagram/` subdirs (PDF datasheets routed to diagram) |
 
 ---
 
 ## CLI reference
 
-All commands are run via `uv run asset <command>` from the repo root, or just `asset <command>` if the virtual environment is activated.
+All commands run via `uv run asset <command>` from the repo root (or just `asset <command>` if the venv is activated).
 
 ```bash
 uv run asset --help
 ```
 
+Common conventions:
+
+- Almost every command has a **dry-run mode** (no flag) and an **execute mode** (`--execute`). Dry runs always write a sheet report you can review before applying.
+- IDs are read from `.env` automatically — most invocations need no arguments beyond the optional `--execute` and any per-command filters.
+- Reports are written to specific tabs (`Diagnose Report`, `Lifestyle Rename`, `Models Report`, etc.) — see `pipeline.config.toml` to rename them.
+
 ---
 
 ### `asset init`
 
-Verifies that credentials are working and that both Google resources are reachable. Run this first whenever you set up the project or rotate credentials.
-
-**Usage:**
+Verifies OAuth credentials and resource access. On the first run it triggers the browser flow.
 
 ```bash
 uv run asset init
-# IDs are read from GOOGLE_SHEETS_MASTER_ID and GOOGLE_DRIVE_ROOT_FOLDER_ID in .env
 ```
-
-**Example output (success):**
-
-```
-Checking Google credentials and resource access…
-
-✓ Google Sheet found:  Product Master
-    ID: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms
-
-✓ Drive folder found:  Products
-    ID: 1a2b3c4d5e6f7g8h9i0j
-```
-
-**Example output (failure):**
-
-```
-Checking Google credentials and resource access…
-
-✗ Google Sheet not accessible: <HttpError 403 "The caller does not have permission">
-
-✗ Drive folder not accessible: <HttpError 404 "File not found: 1a2b3c4d5e6f7g8h9i0j">
-```
-
-Common causes of failure:
-- `GOOGLE_APPLICATION_CREDENTIALS` points to a file that doesn't exist or is not a valid JSON key.
-- The service account email has not been shared on the Sheet or Drive folder.
-- The Sheet ID or Drive folder ID in `.env` is incorrect.
 
 ---
 
 ### `asset diagnose`
 
-Compares the Google Drive products folder against the master Google Sheet and writes a structured report back into the sheet as a new tab.
-
-**What it checks:**
-
-- Every SKU in the sheet has a matching folder in Google Drive.
-- No folders exist in Drive that are not listed in the sheet (orphan folders).
-- Every SKU folder contains all expected subfolders.
-- File count inside each subfolder for every SKU.
-
-Most options are read automatically from `pipeline.config.toml` — in normal use you only need to run:
+Compares Drive against the sheet and writes a row-per-folder report:
 
 ```bash
 uv run asset diagnose
 ```
 
-**Usage:**
+**Report columns**: `SKU | Supplier | Status | isDuplicate | Suggested Rename | Suggested Action | Issues | <13 dir-count columns>`
+
+**Status values**: `OK`, `INCOMPLETE` (subdir missing), `MISSING DIR` (sheet SKU has no folder), `ORPHAN DIR` (folder has no sheet SKU).
+
+**Duplicate detection**: when the same SKU folder name appears in multiple locations (cross-supplier or within-parent), the most-structured occurrence is treated as the primary; secondaries get `isDuplicate=TRUE`. The duplicate's content is compared to the primary using a tiered heuristic that auto-suggests `DELETE` (identical content under different filenames or re-encoded with same dimensions) or `MERGE` (some unique content). The `Issues` column always names the tier that fired.
+
+**Suggested Rename**: only on `ORPHAN DIR` rows — fuzzy-matches against `MISSING DIR` SKUs to suggest the canonical name.
+
+---
+
+### `asset rename`
+
+Applies the `Suggested Rename` column from the diagnose report.
 
 ```bash
-uv run asset diagnose \
-  [--folder-id <drive-folder-id>] \
-  [--sheet-id <google-sheets-id>] \
-  [--tab <sheet-tab>] \
-  [--sku-col <header>] \
-  [--supplier-col <header>] \
-  [--report-tab <tab-name>] \
-  [--config-path pipeline.config.toml]
+uv run asset rename                # dry run — prints rename table
+uv run asset rename --execute      # rename folders in Drive
 ```
 
-**Options:**
+Skips duplicate rows (resolve them with `dedupe` first), skips collisions (two sources targeting the same name, or a target that already exists in Drive). Warns about anything skipped.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--folder-id` | `$GOOGLE_DRIVE_ROOT_FOLDER_ID` | Google Drive root folder ID. |
-| `--sheet-id` | `$GOOGLE_SHEETS_MASTER_ID` | Google Sheets file ID. |
-| `--tab` | `csv.tab_name` in config | Sheet tab that contains the SKU list. |
-| `--sku-col` | `csv.sku_column` in config | Column header for SKU. |
-| `--supplier-col` | `csv.supplier_column` in config | Column header for Supplier. |
-| `--report-tab` | `diagnose.report_tab` in config | Tab the report is written to (created if it doesn't exist). |
-| `--config-path` | `pipeline.config.toml` | Path to the pipeline config file. |
+---
 
-**Example:**
+### `asset dedupe`
+
+Applies the `Suggested Action` column from the diagnose report.
 
 ```bash
-# Everything comes from .env and pipeline.config.toml
-uv run asset diagnose
-
-# Override just the report tab for a dated snapshot
-uv run asset diagnose --report-tab "April 2026 Diagnose"
+uv run asset dedupe                # dry run — prints action table
+uv run asset dedupe --execute      # apply DELETE/MERGE
 ```
 
-**Console output:**
+- `DELETE` trashes the duplicate folder (recoverable from Drive's bin).
+- `MERGE` recursively copies any files in the duplicate that aren't already present at the same relative path in the primary, then trashes the duplicate.
+
+---
+
+### `asset scaffold`
+
+Creates missing SKU folders from the sheet and ensures the canonical subdir structure inside every SKU. Optional flags handle loose files, typos, and clutter.
+
+```bash
+uv run asset scaffold                            # dry run, baseline (just create-missing plan)
+uv run asset scaffold --fix                      # + loose-file routing + typo fixes
+uv run asset scaffold --clean                    # + delete junk + delete non-canonical dirs
+uv run asset scaffold --clean --move             # + quarantine non-canonical dirs in MOVED_FOLDER
+uv run asset scaffold --fix --clean --move --execute   # apply everything
+```
+
+Flag effects:
+
+| Flag | Action types added |
+|------|------|
+| (none) | `CREATE_SKU`, `CREATE_SUBDIR` |
+| `--fix` | + `RENAME_DIR` (typo/case fixes), `MOVE_FILE` (images → photos/, PDFs → diagram/assembly_instructions/carton_layout based on filename keywords), `DUPLICATE_DIR` (informational) |
+| `--clean` | + `DELETE_FILE` (.DS_Store, Thumbs.db, desktop.ini), `DELETE_DIR` (any non-canonical subfolder) |
+| `--clean --move` | replaces `DELETE_DIR` with `MOVE_DIR` → `MOVED_FOLDER/<orig_dir>/<sku>/` |
+| `--execute` | actually apply (otherwise dry-run + report only) |
+
+Execution order is deterministic: `CREATE_SKU` → `RENAME_DIR` → `CREATE_SUBDIR` → `MOVE_FILE` → `DELETE_FILE` → `MOVE_DIR`/`DELETE_DIR`.
+
+Typo detection uses lowercased difflib similarity ≥ `scaffold.typo_cutoff` (default 0.65) against canonical top-level dir names — fires only when the canonical name doesn't already exist in the SKU.
+
+---
+
+### `asset upload-local-files`
+
+Generic local-file uploader with smart SKU matching.
+
+```bash
+# Dry run — scan, infer SKU per file, write report to "Upload - photo" tab
+uv run asset upload-local-files --input ./photos --type photo
+
+# Edit the tab to fix any wrong SKUs, then:
+uv run asset upload-local-files --input ./photos --type photo --execute
+```
+
+**Type aliases** map to subdirectories from `[paths.input]`:
 
 ```
-✓ Read 214 rows from 'Products'
-✓ Scanned 214 SKUs
-✓ Report written → 'Diagnose Report'
-
-Diagnose complete
-  OK           187
-  Incomplete    21
-  Missing dir    4
-  Orphan dirs    2
-  Orphans: OLD-SKU-001, TEST-FOLDER
+photo / photos / product_photos  → product_photos
+lifestyle / lifestyle_photos     → lifestyle_photos
+video / videos                   → videos
+diagram                          → diagram
+assembly / assembly_instructions → assembly_instructions
+carton / carton_layout           → carton_layout
+barcode                          → barcode
+obj / skp / dwg / gltf           → models_*
+thumbnails_website / thumbnails_system → respective paths
 ```
 
-**Report columns:**
+**Matching strategy** (first hit wins, decision recorded in the `Match Decision` column):
 
-| Column | Description |
-|--------|-------------|
-| SKU | Product SKU |
-| Supplier | Supplier name pulled from the sheet |
-| Status | `OK`, `INCOMPLETE`, `MISSING DIR`, or `ORPHAN DIR` |
-| Issues | Human-readable list of missing subfolders (if any) |
-| Product Photos | File count |
-| Lifestyle Photos | File count |
-| Thumbnails / Website | File count |
-| Thumbnails / System | File count |
-| Videos | File count |
-| Diagram | File count |
-| Models / DWG | File count |
-| Models / OBJ | File count |
-| Models / GLTF | File count |
-| Models / SKP | File count |
-| Assembly Instructions | File count |
-| Carton Layout | File count |
-| Barcode | File count |
+| # | Strategy | Confidence |
+|---|---|---|
+| 1 | Filename contains exact SKU | HIGH |
+| 2 | Filename contains exact supplier ref | HIGH |
+| 3 | Filename contains exact product name | HIGH |
+| 4 | Filename has ≥70% of name tokens (e.g. `Mansa Crest Leather Sofa Reel.mp4` matches `Crest Leather Sofa`) | MEDIUM |
+| 5 | Filename has ≥70% of supplier-ref tokens | MEDIUM |
+| 6 | PDF text contains SKU/ref/name | MEDIUM |
+| 7 | Fuzzy filename ≈ SKU / ref / name (highest scoring) | LOW |
+| 8 | None | NONE |
 
-**Status values:**
+Pass `--supplier <name>` to restrict matching to one supplier's SKUs (faster, fewer false positives).
 
-| Status | Meaning |
-|--------|---------|
-| `OK` | SKU folder exists in Drive and contains all expected subfolders. |
-| `INCOMPLETE` | SKU folder exists but one or more subfolders are missing. |
-| `MISSING DIR` | No folder was found in Drive for this SKU. |
-| `ORPHAN DIR` | A folder exists in Drive but the SKU is not listed in the sheet. |
+The report's `Destination SKU` column is the only one that drives upload behavior on `--execute` — edit a SKU, leave it blank to skip, or trust the inferred value. Already-uploaded files are skipped (idempotent).
+
+---
+
+### `asset optimize`
+
+Standardises product photos *or* 3D models, dispatched by `--type`.
+
+```bash
+# Photos: dry-run report
+uv run asset optimize --type photo
+# Photos: execute
+uv run asset optimize --type photo --execute
+
+# 3D models: dry-run report
+uv run asset optimize --type model
+# 3D models: execute
+uv run asset optimize --type model --execute
+
+# Filters work for both
+uv run asset optimize --type photo --supplier mansa --execute
+uv run asset optimize --type model --sku sofa-crest --execute
+```
+
+See [Image optimization details](#image-optimization-details) and [3D model optimization details](#3d-model-optimization-details) below.
 
 ---
 
 ### `asset rename-lifestyle-photos`
 
-Maps lifestyle photo folders (which are named by **parent product**) to their correct SKU names, writes a report to Google Sheets, and optionally renames the folders in Drive.
-
-**How it works:**
-
-The command reads the sheet to build a `parent product → [SKU, ...]` mapping (column order preserved). For each folder found in the lifestyle Drive folder it looks up the parent product name, picks the **first SKU** as the rename target, and notes whether multiple SKUs share that parent product.
-
-**Modes:**
-
-| Mode | Command | Effect |
-|------|---------|--------|
-| Dry run | `uv run asset rename-lifestyle-photos` | Writes report only, no Drive changes |
-| Execute | `uv run asset rename-lifestyle-photos --execute` | Renames folders in Drive, then writes report |
-
-**Usage:**
+Maps a separate lifestyle-photos folder (named by parent product, not SKU) into each SKU's `lifestyle/` subdir. The first SKU per parent product is the destination.
 
 ```bash
-uv run asset rename-lifestyle-photos [--execute]
+uv run asset rename-lifestyle-photos                # dry run + report
+uv run asset rename-lifestyle-photos --execute      # copy files
 ```
 
-**Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--execute` | off | Actually rename folders in Drive. Without this flag the command is a dry run. |
-| `--lifestyle-folder-id` | `$GOOGLE_DRIVE_LIFESTYLE_FOLDER_ID` | Drive folder containing the lifestyle photo folders. |
-| `--sheet-id` | `$GOOGLE_SHEETS_MASTER_ID` | Google Sheets file ID. |
-| `--tab` | `csv.tab_name` in config | Sheet tab with the SKU list. |
-| `--sku-col` | `csv.sku_column` in config | Column header for SKU. |
-| `--parent-product-col` | `csv.parent_product_column` in config | Column header for Parent Product. |
-| `--report-tab` | `lifestyle.report_tab` in config | Tab the report is written to. |
-
-**Report columns:**
-
-| Column | Description |
-|--------|-------------|
-| Parent Product | Current folder name in Drive |
-| Multiple SKUs | `TRUE` if more than one SKU maps to this parent product |
-| URL | Link to the first photo inside the folder |
-| Selected SKU | The SKU the folder will be (or was) renamed to. `NOT IN SHEET` if no match found. |
-
-> **Note:** the service account needs **Editor** access on the lifestyle photos folder to perform renames.
+Idempotent — files already at the destination by name are skipped. Only image extensions are copied (`.jpg`, `.png`, `.webp`, etc.); `.DS_Store` and other non-images are filtered out.
 
 ---
 
-## Pipeline stages
+### `asset copy-models-into-products`
 
-The full pipeline runs in the following order. Each stage is idempotent — safe to re-run.
+Pulls a shared 3D models folder into each SKU's product folder. Compares against the products drive (not the sheet) and creates orphan SKU folders if necessary.
 
-| # | Stage | Status | Description |
-|---|-------|--------|-------------|
-| 1 | `init` | **available** | Verify credentials and confirm access to the Google Sheet and Drive folder. |
-| 2 | `scaffold` | planned | Create per-product folders in Google Drive. |
-| 3 | `inventory` | planned | Scan Drive, classify by subfolder, hash files, diff against last run. |
-| 4 | `diagnose` | **available** | Check folder structure and file counts; write report tab to Google Sheets. |
-| 5 | *(human review)* | — | Review and edit the diagnose report directly in Google Sheets. |
-| 6 | `remediate` | planned | Bulk image fixes driven by the reviewed report. |
-| 7 | `organize` | planned | Enumeration and both-side renames. |
-| 8 | `publish` | planned | Push canonical assets to S3. |
-| 9 | `finalize` | planned | Bump diff date, mark run complete. |
+```bash
+uv run asset copy-models-into-products              # dry run + report
+uv run asset copy-models-into-products --execute    # copy files
+```
 
-`derive` (thumbnails, barcodes, PDF catalog, CMYK conversion) is deferred to v2.
+Source layout (per SKU, with case-insensitive matching and typo recovery for `GITF` → `gltf`):
+
+```
+<models_root>/<supplier>/<sku>/
+├── OBJ/   → copied to <products>/<supplier>/<sku>/models/obj/
+├── SKP/   → models/skp/
+├── DWG/   → models/dwg/
+├── CAD/   → models/dwg/    (same as DWG)
+├── GLTF/  → models/gltf/
+└── PDF/   → diagram/        (PDFs go to /diagram, not models/pdf)
+```
+
+Also supports a nested layout where the type folders live inside an inner `models/` subdir of the SKU. The report flags missing types, unexpected items, orphan SKUs, and SKUs in products with no matching models folder.
+
+---
+
+## Image optimization details
+
+`asset optimize --type photo` reads photos from `<sku>/photos/`, applies a standardisation pipeline, and writes optimized JPEGs to `<sku>/photos_optimized/`. Originals are preserved.
+
+### Dry run report
+
+The dry run downloads each image, analyzes it, and writes a report to the `Optimize Report` tab with embedded image previews. Slow (~1-2 s per image) but informative. Columns:
+
+| Column | Content |
+|---|---|
+| SKU / Supplier | identifies the product |
+| File | original filename |
+| Preview | `=IMAGE(...)` formula pulling a 100×100 thumbnail from Drive |
+| Format | `PNG → JPG` |
+| Dimensions | `3000×2400 → 2000×2000` |
+| Aspect | `1:1` / `tall (3:4)` / `wide (16:9)` |
+| File Size | `4.2MB → ≤2.0MB` |
+| Padding | `12% → 8%` (avg of 4 margins) |
+| Background | `Clean (98% pure white)` / `Subtle off-white (62% pure / 95% near)` / `Has background (45% near-white)` |
+| Actions | semicolon-list of planned operations |
+
+To make previews legible after the first write, manually bump the report tab's row height to ~110px (Sheets remembers it).
+
+### What the pipeline does
+
+| Step | Purpose |
+|------|---------|
+| 1. RGB conversion | flattens any alpha channel onto a white background |
+| 2. Background cleanup | clamps every pixel with all RGB ≥ `white_threshold` (245) to pure `(255,255,255)` — fixes "subtle off-white" |
+| 3. Product bbox detection | finds the bounding box of non-white pixels |
+| 4. Square canvas | crops to product, pads to a square white canvas with the longest side at `(1 - 2*target_padding_pct/100)` of the canvas |
+| 5. Resize | LANCZOS resize to `target_size × target_size` (default 2000) |
+| 6. JPEG encode | quality 85, then auto-drops to 80/75/.../50 until the file fits under `max_file_mb` (2.0) |
+
+Re-runs are idempotent — files already in the destination are skipped.
+
+### Background classification
+
+Uses two thresholds:
+
+- **Pure white** = pixels exactly `(255,255,255)`
+- **Near white** = pixels with all RGB ≥ `white_threshold` (245)
+
+Status lines on the report:
+
+- `Clean (X% pure white)` — both percentages high and similar
+- `Subtle off-white (X% pure / Y% near)` — near-white high, pure-white materially lower → cleanup will clamp to pure white
+- `Has background (X% near-white)` — near-white < 80% → there's actual non-white content beyond the product
+
+### Not in v1
+
+- Color/saturation/white-balance correction (yellowing) — auto-correction can make things worse without scene knowledge
+- Background removal of non-white backgrounds — `rembg` is in deps and could plug in as a `--remove-bg` mode
+
+---
+
+## 3D model optimization details
+
+`asset optimize --type model` runs a 5-stage pipeline ported from `3d-model-optimization/`. It takes a heavy `.obj` exported from Rhino (or any DCC tool that produces over-tessellated NURBS-derived meshes), shrinks it 60-80% without visible loss, and emits both a Collada `.dae` (for SketchUp import) and a `.glb` (for web/three.js).
+
+Sources from `<sku>/models/obj/`. Output goes to `<sku>/models_optimized/`.
+
+### Dry-run report (no OBJ download)
+
+Light-weight: only the (small) MTL is downloaded; texture stats come from Drive metadata. Columns:
+
+| Column | Content |
+|---|---|
+| SKU / Supplier | identifies the product |
+| OBJ File | filename |
+| OBJ Size | current size in MB |
+| Materials | count from MTL |
+| Textures | count of texture files in the OBJ folder |
+| Texture Size | total bytes of textures |
+| Duplicates | groups of byte-identical textures (e.g. `fabric.jpg=fabric_1.jpg`) |
+| Oversized | textures over 1024 px (with current dimensions) |
+| Unused | textures present in folder but not referenced by any material in MTL |
+| Actions | concise list of planned operations |
+
+### Pipeline stages
+
+| Stage | Purpose | Notes |
+|---|---|---|
+| 1. Sanitize | rename materials (strip parens/spaces — Collada XML doesn't allow them), dedupe textures by md5 | Rhino exports often have `Plastic (2)`, duplicated texture files |
+| 2. Split by material | streaming parser splits the master OBJ into one self-contained sub-OBJ per material | Necessary so each piece fits comfortably in RAM during decimation |
+| 3. Decimate | per-mesh **adaptive** quadric edge collapse with bridging-triangle sanity check | Two safety mechanisms; see below |
+| 4. Merge | concat decimated sub-OBJs back into one OBJ + MTL with proper material grouping and texture references | |
+| 5a. Resize textures | downscale any texture whose longer edge exceeds `model_target_texture_px` (1024) | Often saves more bytes than geometry decimation |
+| 5b. Export GLB | `trimesh.Scene.export()` — small, web-friendly | |
+| 5c. Export DAE | hand-built `pycollada` scene (images → effects → materials → geometries → scene nodes) for SketchUp | |
+
+The **adaptive decimation** uses median + p99 edge-length ratios (relative to bbox diagonal) to decide how aggressively to reduce each sub-mesh:
+
+| Median edge ratio | Action |
+|---|---|
+| `> 0.005` (0.5%) | Pass through — already coarse |
+| `0.005 – 0.01` | Mild reduction (55% retention) |
+| `< 0.005` | Aggressive reduction (25% retention) |
+| Plus: p99 edge > 5% of bbox | Pass through regardless |
+
+The **stretched-triangle sanity check** measures the longest output edge after decimation and rejects the result (passing the original through unchanged) if it exceeds `model_decim_max_stretch` (10%) of the bounding box diagonal — this catches edges that bridge across implicit feature boundaries (cushion seams, panel separations) and would visibly tear the model.
+
+### After execute — SketchUp final step
+
+```
+1. Open SketchUp → File → Import…
+2. Filter: COLLADA File (*.dae)
+3. Select <sku>/models_optimized/model.dae
+4. After import, File → Save As… → SketchUp File (.skp)
+```
+
+Make sure the textures (`*.jpeg`) are in the same folder as the `.dae` — SketchUp resolves them by relative path.
+
+### Dependencies (already in the SDK)
+
+`fast-simplification` (pure-C++ decimator, no GL/Qt), `trimesh`, `pycollada`, `numpy`, `Pillow`.
 
 ---
 
@@ -547,26 +659,34 @@ The full pipeline runs in the following order. Each stage is idempotent — safe
 
 ```
 packages/db/
-  alembic/              Alembic migration environment and versions
+  alembic/                        Alembic migration environment + versions
   src/asset_db/
-    models.py           SQLAlchemy ORM models
-    session.py          Async session factory
+    models.py                     SQLAlchemy ORM models (typed Mapped[...] style)
+    session.py                    Async session factory
 
 packages/sdk/
   src/asset_sdk/
-    config.py           PipelineConfig dataclass, loaded from pipeline.config.toml
+    config.py                     PipelineConfig dataclasses
     adapters/
-      drive.py          Google Drive folder listing and file counting
-      sheets.py         Google Sheets read/write
+      drive.py                    OAuth, list/move/copy/upload/download
+      sheets.py                   gspread wrapper
     stages/
-      diagnose.py       Diagnose stage logic
+      diagnose.py                 Drive vs sheet audit + duplicate analysis
+      rename_skus.py              Apply Suggested Rename column
+      dedupe.py                   Apply Suggested Action column (DELETE/MERGE)
+      scaffold.py                 Create missing folders, fix loose files, clean clutter
+      upload_local_files.py       Generic local-file uploader with fuzzy SKU match
+      rename_lifestyle.py         Lifestyle-folder → SKU lifestyle/ subdir
+      copy_models.py              Shared models drive → SKU models/<type>/ + diagram/
+      optimize_photos.py          Photo standardisation pipeline
+      optimize_models.py          5-stage 3D-model optimization pipeline
 
 apps/cli/
   src/asset_cli/
-    main.py             Typer app — all CLI commands live here
+    main.py                       Typer app — every CLI command lives here
 
-apps/api/               FastAPI service (v2)
-apps/web/               Next.js 15 front-end (v2)
+apps/api/                         FastAPI service (v2)
+apps/web/                         Next.js 15 front-end (v2)
 ```
 
 ### Common make targets
@@ -574,21 +694,13 @@ apps/web/               Next.js 15 front-end (v2)
 ```bash
 make up          # Start Postgres in Docker
 make down        # Stop Postgres
-make install     # Install all Python + JS deps  (uv sync + pnpm install)
+make install     # uv sync + pnpm install
 make migrate     # Apply pending Alembic migrations
-make test        # Run pytest
+make test        # pytest
 make lint        # ruff check + mypy
 make format      # ruff format + ruff --fix
-make psql        # Open a psql shell on the dev database
-make clean       # Stop containers, clear all caches
-```
-
-### Running tests
-
-```bash
-make test
-# or directly:
-uv run pytest
+make psql        # psql shell on the dev database
+make clean       # Stop containers, clear caches
 ```
 
 ### Adding a migration
@@ -597,6 +709,6 @@ After changing models in `packages/db/src/asset_db/models.py`:
 
 ```bash
 make migration NAME=add_foo_column
-# then review the generated file in packages/db/alembic/versions/
+# Review the generated file in packages/db/alembic/versions/
 make migrate
 ```

@@ -1,112 +1,155 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Generator, NamedTuple
 
 from asset_sdk.adapters import drive
 from asset_sdk.config import InputPaths
 
-# Expected subdirectory names inside each SKU folder (case-insensitive).
-_EXPECTED_DIRS = {"obj", "skp", "dwg", "pdf", "gltf"}
+# Expected subdirectory names inside each SKU folder (case-insensitive, after normalisation).
+_EXPECTED_DIRS = {"obj", "skp", "dwg", "cad", "pdf", "gltf"}
+
+# Known typos / transpositions mapped to their canonical name.
+_DIR_ALIASES: dict[str, str] = {
+    "gitf": "gltf",
+    "gitlf": "gltf",
+    "gtlf": "gltf",
+    "glft": "gltf",
+}
+
+
+def _normalise(name: str) -> str:
+    lower = name.lower()
+    return _DIR_ALIASES.get(lower, lower)
 
 
 @dataclass
 class ModelEntry:
     sku_name: str
     sku_folder_id: str
-    in_sheet: bool
-    in_products: bool
-    present_dirs: list[str]  # lowercase: which of the expected dirs are present
-    extra_items: list[str]   # unexpected file/folder names directly inside the SKU folder
+    supplier_name: str | None     # source supplier (None when structure='flat')
+    is_orphan: bool               # True when no matching SKU folder exists in products drive
+    dir_sources: dict[str, str]   # {canonical dir name: source folder id}
+    extra_items: list[str]        # unrecognised items at the SKU root level
+    has_nested_models: bool = False
+
+    @property
+    def present_dirs(self) -> list[str]:
+        return sorted(self.dir_sources.keys())
+
+
+def _scan_sku_folder(sku_folder_id: str) -> tuple[dict[str, str], list[str], bool]:
+    """Return (dir_sources, extra_items, has_nested_models) for one SKU folder."""
+    children = drive.list_children(sku_folder_id)
+
+    dir_sources: dict[str, str] = {}
+    extra_items: list[str] = []
+    nested_models_id: str | None = None
+
+    for item in children:
+        canonical = _normalise(item["name"])
+        if item["kind"] == "folder":
+            if canonical in _EXPECTED_DIRS:
+                dir_sources[canonical] = item["id"]
+            elif canonical == "models":
+                nested_models_id = item["id"]
+            else:
+                extra_items.append(item["name"])
+        else:
+            extra_items.append(item["name"])
+
+    has_nested = False
+    if nested_models_id:
+        for item in drive.list_children(nested_models_id):
+            canonical = _normalise(item["name"])
+            if item["kind"] == "folder" and canonical in _EXPECTED_DIRS:
+                if canonical not in dir_sources:
+                    dir_sources[canonical] = item["id"]
+                    has_nested = True
+
+    return dir_sources, sorted(extra_items), has_nested
+
+
+def _collect_sku_folders(
+    folder_id: str, structure: str
+) -> dict[str, tuple[str, str | None]]:
+    """Return {sku_name: (sku_folder_id, supplier_name)} from a root folder."""
+    if structure == "flat":
+        return {name: (fid, None) for name, fid in drive.list_folders(folder_id).items()}
+
+    result: dict[str, tuple[str, str | None]] = {}
+    for supplier_name, supplier_id in drive.list_folders(folder_id).items():
+        for sku_name, sku_id in drive.list_folders(supplier_id).items():
+            result[sku_name] = (sku_id, supplier_name)
+    return result
 
 
 def build_report(
     models_folder_id: str,
-    sheet_skus: set[str],
     root_folder_id: str,
     structure: str,
 ) -> tuple[list[ModelEntry], list[str]]:
-    """Scan the models folder and cross-reference with the sheet and products drive.
+    """Scan the models folder and cross-reference with the products drive.
 
     Returns:
-        entries        — one ModelEntry per SKU folder found in models_folder_id
-        missing_skus   — SKU names that are in the sheet but absent from models
+        entries  — one ModelEntry per SKU folder in models (orphans included)
+        missing  — SKU names present in products drive but absent from models
     """
-    if structure == "flat":
-        products_skus: set[str] = set(drive.list_folders(root_folder_id).keys())
-    else:
-        products_skus = set()
-        for supplier_id in drive.list_folders(root_folder_id).values():
-            products_skus.update(drive.list_folders(supplier_id).keys())
-
-    model_folders = drive.list_folders(models_folder_id)  # {sku_name: folder_id}
+    products_skus = _collect_sku_folders(root_folder_id, structure)
+    model_skus = _collect_sku_folders(models_folder_id, structure)
 
     entries: list[ModelEntry] = []
-    for sku_name, sku_folder_id in sorted(model_folders.items()):
-        children = drive.list_children(sku_folder_id)
-        present_dirs: list[str] = []
-        extra_items: list[str] = []
-        for item in children:
-            name_lower = item["name"].lower()
-            if item["kind"] == "folder" and name_lower in _EXPECTED_DIRS:
-                present_dirs.append(name_lower)
-            else:
-                extra_items.append(item["name"])
-
+    for sku_name, (sku_folder_id, supplier_name) in sorted(model_skus.items()):
+        dir_sources, extra_items, has_nested = _scan_sku_folder(sku_folder_id)
         entries.append(ModelEntry(
             sku_name=sku_name,
             sku_folder_id=sku_folder_id,
-            in_sheet=sku_name in sheet_skus,
-            in_products=sku_name in products_skus,
-            present_dirs=sorted(present_dirs),
-            extra_items=sorted(extra_items),
+            supplier_name=supplier_name,
+            is_orphan=sku_name not in products_skus,
+            dir_sources=dir_sources,
+            extra_items=extra_items,
+            has_nested_models=has_nested,
         ))
 
-    missing_skus = sorted(sheet_skus - set(model_folders.keys()))
-    return entries, missing_skus
+    missing = sorted(set(products_skus.keys()) - set(model_skus.keys()))
+    return entries, missing
 
 
 def to_sheet_rows(
     entries: list[ModelEntry],
-    missing_skus: list[str],
+    missing: list[str],
 ) -> tuple[list[str], list[list]]:
     headers = [
-        "SKU", "In Sheet", "In Products Drive",
-        "OBJ", "SKP", "DWG", "PDF", "GLTF",
-        "Extra Items", "Status",
+        "SKU", "Supplier", "Status",
+        "OBJ", "SKP", "DWG/CAD", "PDF", "GLTF",
+        "Nested Models Folder", "Extra Items",
     ]
 
     rows: list[list] = []
     for e in entries:
-        issues: list[str] = []
-        if not e.in_sheet:
-            issues.append("not in sheet")
-        if not e.in_products:
-            issues.append("not in products drive")
+        if e.is_orphan:
+            status = "ORPHAN (will be created)"
+        else:
+            status = "OK"
         if e.extra_items:
-            issues.append("has extra items")
+            status += " — has extras"
 
+        has_dwg_cad = "dwg" in e.dir_sources or "cad" in e.dir_sources
         rows.append([
             e.sku_name,
-            "TRUE" if e.in_sheet else "FALSE",
-            "TRUE" if e.in_products else "FALSE",
-            "TRUE" if "obj" in e.present_dirs else "FALSE",
-            "TRUE" if "skp" in e.present_dirs else "FALSE",
-            "TRUE" if "dwg" in e.present_dirs else "FALSE",
-            "TRUE" if "pdf" in e.present_dirs else "FALSE",
-            "TRUE" if "gltf" in e.present_dirs else "FALSE",
+            e.supplier_name or "",
+            status,
+            "TRUE" if "obj"  in e.dir_sources else "FALSE",
+            "TRUE" if "skp"  in e.dir_sources else "FALSE",
+            "TRUE" if has_dwg_cad             else "FALSE",
+            "TRUE" if "pdf"  in e.dir_sources else "FALSE",
+            "TRUE" if "gltf" in e.dir_sources else "FALSE",
+            "TRUE" if e.has_nested_models     else "FALSE",
             ", ".join(e.extra_items),
-            "OK" if not issues else ", ".join(issues),
         ])
 
-    for sku in missing_skus:
-        rows.append([
-            sku,
-            "TRUE", "",
-            "", "", "", "", "",
-            "",
-            "missing from models",
-        ])
+    for sku in missing:
+        rows.append([sku, "", "MISSING (no models)", "", "", "", "", "", "", ""])
 
     return headers, rows
 
@@ -117,9 +160,20 @@ def to_sheet_rows(
 
 class ModelCopyProgress(NamedTuple):
     sku_name: str
-    file_index: int   # 1-based; 0 means nothing to copy (already done)
-    file_total: int   # 0 means nothing to copy
-    source_dir: str   # e.g. "OBJ" — which subdirectory is being copied
+    file_index: int   # 1-based; 0 = nothing new to copy
+    file_total: int   # 0 = nothing new to copy
+    source_dir: str   # e.g. "OBJ"
+
+
+def _dest_subdir(dir_lower: str, paths: InputPaths) -> str:
+    return {
+        "obj":  paths.models_obj,
+        "skp":  paths.models_skp,
+        "dwg":  paths.models_dwg,
+        "cad":  paths.models_dwg,    # CAD → same as DWG
+        "gltf": paths.models_gltf,
+        "pdf":  paths.diagram,       # PDFs → /diagram
+    }[dir_lower]
 
 
 def execute_copy(
@@ -128,59 +182,37 @@ def execute_copy(
     structure: str,
     paths: InputPaths,
 ) -> Generator[ModelCopyProgress, None, None]:
-    """Copy model files from the models folder into each SKU's product folder.
-
-    Destination mapping:
-      OBJ  → paths.models_obj   (e.g. models/obj)
-      SKP  → paths.models_skp
-      DWG  → paths.models_dwg
-      GLTF → paths.models_gltf
-      PDF  → paths.diagram      (not models/pdf — diagrams go in /diagram)
-
-    Yields a ModelCopyProgress after each file is copied.
-    Yields file_total=0 when an entry has nothing new to copy (already done).
-    """
-    if structure == "flat":
-        sku_folders: dict[str, str] = drive.list_folders(root_folder_id)
-    else:
-        sku_folders = {}
-        for supplier_id in drive.list_folders(root_folder_id).values():
-            sku_folders.update(drive.list_folders(supplier_id))
-
-    dest_map: dict[str, str] = {
-        "obj":  paths.models_obj,
-        "skp":  paths.models_skp,
-        "dwg":  paths.models_dwg,
-        "gltf": paths.models_gltf,
-        "pdf":  paths.diagram,
-    }
+    """Copy model files into each SKU's product folder, creating orphan SKU folders as needed."""
+    products_skus = _collect_sku_folders(root_folder_id, structure)
+    # Cache supplier folder IDs so we don't re-create them for each orphan SKU.
+    supplier_cache: dict[str, str] = (
+        dict(drive.list_folders(root_folder_id)) if structure == "supplier" else {}
+    )
 
     for e in entries:
-        if not e.in_products or e.sku_name not in sku_folders:
-            continue
-        sku_dest_id = sku_folders[e.sku_name]
+        # Resolve (or create) the destination SKU folder.
+        if e.sku_name in products_skus:
+            sku_dest_id = products_skus[e.sku_name][0]
+        elif structure == "flat":
+            sku_dest_id = drive.find_or_create_folder(e.sku_name, root_folder_id)
+        else:
+            supplier = e.supplier_name or "_unsorted"
+            if supplier not in supplier_cache:
+                supplier_cache[supplier] = drive.find_or_create_folder(supplier, root_folder_id)
+            sku_dest_id = drive.find_or_create_folder(e.sku_name, supplier_cache[supplier])
 
-        # Resolve source subdirectories.
-        src_children = drive.list_children(e.sku_folder_id)
-        src_dirs: dict[str, str] = {
-            item["name"].lower(): item["id"]
-            for item in src_children
-            if item["kind"] == "folder" and item["name"].lower() in _EXPECTED_DIRS
-        }
-
-        # Collect all files to copy, grouped by destination subdir.
-        # (file_id, file_name, source_dir_upper, dest_subdir)
+        # Collect candidate files: (file_id, file_name, source_label, dest_subdir)
         candidates: list[tuple[str, str, str, str]] = []
-        for dir_lower, src_id in src_dirs.items():
-            dest_subdir = dest_map[dir_lower]
-            for f in drive.list_files(src_id):
-                candidates.append((f["id"], f["name"], dir_lower.upper(), dest_subdir))
+        for dir_canonical, src_folder_id in e.dir_sources.items():
+            dest_subdir = _dest_subdir(dir_canonical, paths)
+            for f in drive.list_files(src_folder_id):
+                candidates.append((f["id"], f["name"], dir_canonical.upper(), dest_subdir))
 
         if not candidates:
             yield ModelCopyProgress(e.sku_name, 0, 0, "")
             continue
 
-        # Resolve (and cache) destination folders + existing file names.
+        # Resolve and cache each destination subfolder once, with its existing file names.
         dest_cache: dict[str, tuple[str, set[str]]] = {}
         for _, _, _, dest_subdir in candidates:
             if dest_subdir not in dest_cache:
@@ -196,7 +228,7 @@ def execute_copy(
             yield ModelCopyProgress(e.sku_name, 0, 0, "")
             continue
 
-        for i, (file_id, file_name, src_dir, dest_subdir) in enumerate(to_copy, 1):
+        for i, (file_id, file_name, src_label, dest_subdir) in enumerate(to_copy, 1):
             dest_id = dest_cache[dest_subdir][0]
             drive.copy_file(file_id, dest_id, file_name)
-            yield ModelCopyProgress(e.sku_name, i, len(to_copy), src_dir)
+            yield ModelCopyProgress(e.sku_name, i, len(to_copy), src_label)

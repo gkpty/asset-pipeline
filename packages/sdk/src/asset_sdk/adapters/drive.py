@@ -7,6 +7,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 _SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -100,6 +101,50 @@ def count_files(folder_id: str) -> int:
         if not page_token:
             break
     return count
+
+
+def list_children_meta(folder_id: str) -> list[dict]:
+    """Return [{id, name, kind, size, md5, width, height}, ...] for all non-trashed items.
+
+    size is a string (Drive returns it that way) or None for folders/Google Docs.
+    md5 is None for folders, Google Docs, and files without a checksum.
+    width/height come from imageMediaMetadata (None for non-images).
+    """
+    svc = _service()
+    result: list[dict] = []
+    page_token: str | None = None
+    q = f"'{folder_id}' in parents and trashed=false"
+    fields = (
+        "nextPageToken, files(id, name, mimeType, size, md5Checksum, "
+        "imageMediaMetadata(width, height))"
+    )
+    while True:
+        resp = (
+            svc.files()
+            .list(
+                q=q,
+                fields=fields,
+                pageToken=page_token,
+                pageSize=1000,
+                **_SD,
+            )
+            .execute()
+        )
+        for f in resp.get("files", []):
+            meta = f.get("imageMediaMetadata") or {}
+            result.append({
+                "id": f["id"],
+                "name": f["name"],
+                "kind": "folder" if f["mimeType"] == _FOLDER_MIME else "file",
+                "size": f.get("size"),
+                "md5": f.get("md5Checksum"),
+                "width": meta.get("width"),
+                "height": meta.get("height"),
+            })
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return result
 
 
 def list_children(folder_id: str) -> list[dict[str, str]]:
@@ -210,6 +255,52 @@ def copy_file(file_id: str, dest_folder_id: str, name: str) -> str:
     return resp["id"]
 
 
+def download_file(file_id: str, local_path: str) -> None:
+    """Download a Drive file's binary content to local_path."""
+    request = _service().files().get_media(fileId=file_id, supportsAllDrives=True)
+    with open(local_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+
+def upload_file(local_path: str, dest_folder_id: str, name: str, mime_type: str) -> str:
+    """Upload a local file into dest_folder_id with the given name. Returns the new file ID."""
+    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+    resp = (
+        _service()
+        .files()
+        .create(
+            body={"name": name, "parents": [dest_folder_id]},
+            media_body=media,
+            fields="id",
+            **_SD_W,
+        )
+        .execute()
+    )
+    return resp["id"]
+
+
 def rename_item(file_id: str, new_name: str) -> None:
     """Rename a Drive file or folder in place."""
     _service().files().update(fileId=file_id, body={"name": new_name}, **_SD_W).execute()
+
+
+def trash_item(file_id: str) -> None:
+    """Move a Drive file or folder to trash (recoverable, not permanent delete)."""
+    _service().files().update(fileId=file_id, body={"trashed": True}, **_SD_W).execute()
+
+
+def move_item(file_id: str, new_parent_id: str) -> None:
+    """Re-parent a Drive file or folder under new_parent_id (removes prior parents)."""
+    svc = _service()
+    info = svc.files().get(fileId=file_id, fields="parents", **_SD_W).execute()
+    prev = ",".join(info.get("parents", []) or [])
+    svc.files().update(
+        fileId=file_id,
+        addParents=new_parent_id,
+        removeParents=prev,
+        fields="id, parents",
+        **_SD_W,
+    ).execute()
