@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
+import threading
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -17,33 +17,50 @@ _SD_W = {"supportsAllDrives": True}
 
 _DEFAULT_TOKEN_PATH = ".secrets/oauth_token.json"
 
+# googleapiclient's `service` object (and the underlying httplib2 Http) is NOT
+# thread-safe. We share one Credentials object across threads (it has its own
+# refresh lock), but build a fresh service per thread via threading.local.
+_creds_lock = threading.Lock()
+_cached_creds: Credentials | None = None
+_thread_local = threading.local()
+
 
 def _get_creds() -> Credentials:
-    client_json = os.environ.get("GOOGLE_OAUTH_CREDENTIALS")
-    if not client_json:
-        raise RuntimeError("GOOGLE_OAUTH_CREDENTIALS is not set")
-    token_path = os.environ.get("GOOGLE_OAUTH_TOKEN_PATH", _DEFAULT_TOKEN_PATH)
+    global _cached_creds
+    with _creds_lock:
+        if _cached_creds is not None and _cached_creds.valid:
+            return _cached_creds
 
-    creds: Credentials | None = None
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, _SCOPES)
+        client_json = os.environ.get("GOOGLE_OAUTH_CREDENTIALS")
+        if not client_json:
+            raise RuntimeError("GOOGLE_OAUTH_CREDENTIALS is not set")
+        token_path = os.environ.get("GOOGLE_OAUTH_TOKEN_PATH", _DEFAULT_TOKEN_PATH)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(client_json, _SCOPES)
-            creds = flow.run_local_server(port=0)
-        os.makedirs(os.path.dirname(token_path) or ".", exist_ok=True)
-        with open(token_path, "w") as fh:
-            fh.write(creds.to_json())
+        creds: Credentials | None = None
+        if os.path.exists(token_path):
+            creds = Credentials.from_authorized_user_file(token_path, _SCOPES)
 
-    return creds  # type: ignore[return-value]
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(client_json, _SCOPES)
+                creds = flow.run_local_server(port=0)
+            os.makedirs(os.path.dirname(token_path) or ".", exist_ok=True)
+            with open(token_path, "w") as fh:
+                fh.write(creds.to_json())
+
+        _cached_creds = creds
+        return creds  # type: ignore[return-value]
 
 
-@lru_cache(maxsize=1)
 def _service():
-    return build("drive", "v3", credentials=_get_creds(), cache_discovery=False)
+    """Per-thread Drive service (httplib2 isn't thread-safe)."""
+    svc = getattr(_thread_local, "service", None)
+    if svc is None:
+        svc = build("drive", "v3", credentials=_get_creds(), cache_discovery=False)
+        _thread_local.service = svc
+    return svc
 
 
 def get_item_name(file_id: str) -> str:
@@ -178,7 +195,12 @@ def list_children(folder_id: str) -> list[dict[str, str]]:
 
 
 def list_files(folder_id: str) -> list[dict[str, str]]:
-    """Return [{id, name}, ...] for all non-folder, non-trashed files in folder_id."""
+    """Return [{id, name, thumbnailLink}, ...] for all non-folder, non-trashed files.
+
+    thumbnailLink is a short-lived (~hours) pre-signed URL that loads without browser
+    cookies — much more reliable for embedding in a web UI than drive.google.com/thumbnail.
+    Field is missing for files Drive hasn't generated a thumbnail for.
+    """
     svc = _service()
     result: list[dict[str, str]] = []
     page_token: str | None = None
@@ -188,7 +210,7 @@ def list_files(folder_id: str) -> list[dict[str, str]]:
             svc.files()
             .list(
                 q=q,
-                fields="nextPageToken, files(id, name)",
+                fields="nextPageToken, files(id, name, thumbnailLink)",
                 pageToken=page_token,
                 pageSize=1000,
                 **_SD,
@@ -290,6 +312,68 @@ def rename_item(file_id: str, new_name: str) -> None:
 def trash_item(file_id: str) -> None:
     """Move a Drive file or folder to trash (recoverable, not permanent delete)."""
     _service().files().update(fileId=file_id, body={"trashed": True}, **_SD_W).execute()
+
+
+def list_files_with_anyone(folder_id: str) -> list[dict]:
+    """Return [{id, name, anyone_role}, ...] for files in folder_id.
+
+    anyone_role is 'reader'/'writer'/'commenter' if the file has an 'anyone' permission,
+    or None if it doesn't.
+    """
+    svc = _service()
+    result: list[dict] = []
+    page_token: str | None = None
+    q = f"'{folder_id}' in parents and mimeType!='{_FOLDER_MIME}' and trashed=false"
+    fields = (
+        "nextPageToken, files(id, name, permissions(id, type, role))"
+    )
+    while True:
+        resp = (
+            svc.files()
+            .list(q=q, fields=fields, pageToken=page_token, pageSize=1000, **_SD)
+            .execute()
+        )
+        for f in resp.get("files", []):
+            anyone_role = None
+            for p in f.get("permissions", []) or []:
+                if p.get("type") == "anyone":
+                    anyone_role = p.get("role")
+                    break
+            result.append({
+                "id": f["id"], "name": f["name"], "anyone_role": anyone_role,
+            })
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return result
+
+
+def add_anyone_permission(file_id: str, role: str = "reader") -> None:
+    """Grant 'anyone with the link' a role (default reader = view-only)."""
+    _service().permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": role},
+        fields="id",
+        **_SD_W,
+    ).execute()
+
+
+def remove_anyone_permission(file_id: str) -> bool:
+    """Remove any 'anyone' permission on file_id. Returns True if one was removed."""
+    svc = _service()
+    resp = svc.permissions().list(
+        fileId=file_id,
+        fields="permissions(id, type, role)",
+        **_SD_W,
+    ).execute()
+    removed = False
+    for p in resp.get("permissions", []):
+        if p.get("type") == "anyone":
+            svc.permissions().delete(
+                fileId=file_id, permissionId=p["id"], **_SD_W,
+            ).execute()
+            removed = True
+    return removed
 
 
 def move_item(file_id: str, new_parent_id: str) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -1234,6 +1235,431 @@ def scaffold(
 
     console.print(
         f"\n[bold]Scaffold complete[/bold] — {applied} applied, {errored} errored."
+    )
+
+
+@app.command("set-permissions")
+def set_permissions(
+    asset_type: str = typer.Option(
+        ..., "--type",
+        help="Subfolder type to target (photo, lifestyle, video, diagram, models_obj, etc.).",
+    ),
+    access: str = typer.Option(
+        ..., "--access",
+        help="public  → anyone with the link can view  |  private → remove anyone-link access",
+    ),
+    sku_filter: Optional[str] = typer.Option(None, "--sku", help="Limit to one SKU."),
+    supplier_filter: Optional[str] = typer.Option(
+        None, "--supplier", help="Limit to one supplier.",
+    ),
+    config_path: Path = typer.Option(
+        Path("pipeline.config.toml"),
+        envvar="PIPELINE_CONFIG_PATH",
+        help="Path to pipeline.config.toml.",
+    ),
+    root_folder_id: str = typer.Option(
+        ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
+        help="Google Drive products root folder ID.",
+    ),
+    execute: bool = typer.Option(
+        False, "--execute",
+        help="Apply the permission changes. Omit for a dry run.",
+    ),
+) -> None:
+    """
+    Set Drive file permissions on every file under <sku>/<type-subdir>/ recursively.
+
+    Examples:
+      uv run asset set-permissions --type photo --access public --execute
+      uv run asset set-permissions --type models_obj --access private --execute
+      uv run asset set-permissions --type lifestyle --access public --supplier mansa --execute
+
+    public  = grants 'anyone with the link can view' to every file
+    private = removes any 'anyone' permission, leaving only explicitly-shared users
+    """
+    from rich.table import Table
+
+    from asset_sdk.config import PipelineConfig
+    from asset_sdk.stages.permissions import (
+        execute as run_perms,
+        find_targets,
+        summarise,
+    )
+    from asset_sdk.stages.upload_local_files import resolve_type_subdir
+
+    if access not in ("public", "private"):
+        raise typer.BadParameter("--access must be 'public' or 'private'")
+
+    cfg = PipelineConfig.load(config_path)
+    src_subdir = resolve_type_subdir(asset_type, cfg.paths)
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        t = progress.add_task(f"Scanning <sku>/{src_subdir}/ files…", total=None)
+        targets = find_targets(
+            root_folder_id, cfg.drive.structure, src_subdir,
+            sku_filter, supplier_filter,
+        )
+        progress.update(t, description=f"Found {len(targets)} files across SKUs")
+        progress.stop_task(t)
+
+    if not targets:
+        console.print(f"[yellow]No files found under <sku>/{src_subdir}/.[/yellow]")
+        return
+
+    counts = summarise(targets, access)
+
+    table = Table(title=f"Permission plan: {access} on <sku>/{src_subdir}/ ({counts['total']} files)")
+    table.add_column("Action", style="bold")
+    table.add_column("Count", justify="right")
+    if access == "public":
+        table.add_row("[green]Make public[/green]", str(counts["to_change"]))
+    else:
+        table.add_row("[yellow]Make private[/yellow]", str(counts["to_change"]))
+    table.add_row("Already in target state", str(counts["no_change"]))
+    console.print(table)
+
+    if not execute:
+        console.print(
+            f"\n[bold]Dry run complete[/bold] — pass --execute to update "
+            f"{counts['to_change']} files."
+        )
+        return
+
+    if counts["to_change"] == 0:
+        console.print("\n[green]Nothing to do — all files are already in the target state.[/green]")
+        return
+
+    bar = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=30),
+        MofNCompleteColumn(),
+        console=console,
+    )
+    changed = unchanged = errored = 0
+    with bar:
+        bar_task = bar.add_task("Updating…", total=len(targets), completed=0)
+        for p in run_perms(targets, access):
+            if p.action == "error":
+                errored += 1
+                bar.update(
+                    bar_task,
+                    description=f"  [red]error[/red] {p.target.supplier}/{p.target.sku}/{p.target.file_name}: {p.error}",
+                    advance=1,
+                )
+            elif p.action == "no_change":
+                unchanged += 1
+                bar.update(bar_task, description=f"  skip: {p.target.file_name}", advance=1)
+            else:
+                changed += 1
+                colour = "green" if p.action == "made_public" else "yellow"
+                bar.update(
+                    bar_task,
+                    description=f"  [{colour}]{p.action}[/{colour}] {p.target.supplier}/{p.target.sku}/{p.target.file_name}",
+                    advance=1,
+                )
+
+    console.print(
+        f"\n[bold]Permissions updated[/bold]  "
+        f"({changed} changed, {unchanged} unchanged, {errored} errored)"
+    )
+
+
+@app.command("organize")
+def organize(
+    rename: bool = typer.Option(
+        False, "--rename",
+        help="Read saved photo orders from the DB and rename files in Drive (1.jpg, 2.jpg, ...).",
+    ),
+    execute: bool = typer.Option(
+        False, "--execute",
+        help="With --rename: actually perform the renames. Without: dry run.",
+    ),
+    api_port: int = typer.Option(8000, help="Port for the FastAPI backend."),
+    web_port: int = typer.Option(3000, help="Port for the Next.js dev server."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't auto-open the browser."),
+    config_path: Path = typer.Option(
+        Path("pipeline.config.toml"),
+        envvar="PIPELINE_CONFIG_PATH",
+        help="Path to pipeline.config.toml.",
+    ),
+    root_folder_id: Optional[str] = typer.Option(
+        None, envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
+        help="Google Drive products root folder ID (only used with --rename).",
+    ),
+) -> None:
+    """
+    Run the photo-reorder web app, or apply saved orders to Drive (--rename).
+
+    Without --rename: starts the FastAPI backend and Next.js dev server, then opens a
+    browser to the SKU grid. Click a SKU to drag-and-drop photos into the desired order
+    and click Save. The order is persisted in the photo_orders table.
+
+    With --rename: reads every saved order from photo_orders and (with --execute) renames
+    the files in Drive sequentially as 1.<ext>, 2.<ext>, …
+    """
+    if rename:
+        _organize_rename(config_path, root_folder_id, execute)
+        return
+    _organize_serve(api_port, web_port, no_browser)
+
+
+def _organize_serve(api_port: int, web_port: int, no_browser: bool) -> None:
+    """Start the FastAPI backend + Next.js dev server, open the browser."""
+    import shutil
+    import signal
+    import subprocess
+    import time
+    import webbrowser
+
+    repo_root = Path(__file__).resolve().parents[4]
+    web_dir = repo_root / "apps" / "web"
+    if not web_dir.exists():
+        console.print(f"[red]apps/web directory not found at {web_dir}[/red]")
+        raise typer.Exit(1)
+
+    pnpm = shutil.which("pnpm")
+    if not pnpm:
+        console.print("[red]pnpm not found on PATH. Install pnpm first.[/red]")
+        raise typer.Exit(1)
+
+    # Always run pnpm install (idempotent + cheap; catches new deps in package.json).
+    console.print("[bold]Syncing web dependencies (pnpm install)…[/bold]")
+    r = subprocess.run([pnpm, "install"], cwd=str(web_dir))
+    if r.returncode != 0:
+        raise typer.Exit(r.returncode)
+
+    api_proc: subprocess.Popen | None = None
+    web_proc: subprocess.Popen | None = None
+
+    def _cleanup(*_args):  # signal handler — terminate both children
+        for p, name in ((web_proc, "web"), (api_proc, "api")):
+            if p and p.poll() is None:
+                console.print(f"[yellow]Stopping {name}…[/yellow]")
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
+
+    import urllib.error
+    import urllib.request
+
+    def _wait_for(url: str, timeout: float, label: str) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(url, timeout=1).read()
+                return True
+            except (urllib.error.URLError, ConnectionRefusedError, OSError):
+                # Bail out early if either child has died.
+                if (api_proc and api_proc.poll() is not None) or (
+                    web_proc and web_proc.poll() is not None
+                ):
+                    return False
+                time.sleep(0.4)
+        console.print(f"[red]{label} did not become reachable within {timeout:.0f}s.[/red]")
+        return False
+
+    try:
+        console.print(f"[bold]Starting API on :{api_port}…[/bold]")
+        api_proc = subprocess.Popen(
+            [
+                "uv", "run", "uvicorn", "asset_api.main:app",
+                "--host", "127.0.0.1", "--port", str(api_port),
+            ],
+            cwd=str(repo_root),
+        )
+
+        if not _wait_for(f"http://127.0.0.1:{api_port}/api/health", 30.0, "API"):
+            console.print(
+                "[red]The API failed to start. Check the terminal output above for "
+                "tracebacks (most common: GOOGLE_OAUTH_CREDENTIALS missing, "
+                "DATABASE_URL not set, or port 8000 already in use).[/red]"
+            )
+            return
+
+        console.print(f"[bold]Starting web on :{web_port}…[/bold]")
+        env = os.environ.copy()
+        env["PORT"] = str(web_port)
+        web_proc = subprocess.Popen(
+            [pnpm, "dev", "--port", str(web_port)],
+            cwd=str(web_dir),
+            env=env,
+        )
+
+        if not _wait_for(f"http://127.0.0.1:{web_port}/", 60.0, "Web"):
+            console.print("[red]The Next.js dev server did not start. See the log above.[/red]")
+            return
+
+        url = f"http://localhost:{web_port}"
+        console.print(f"\n[green]✓ API ready on :{api_port}, web ready on :{web_port}[/green]")
+        console.print(f"[green]Open {url} in your browser.[/green]")
+        if not no_browser:
+            webbrowser.open(url)
+        console.print("[bold]Press Ctrl+C to stop.[/bold]\n")
+
+        # Wait for either process to exit (or for Ctrl+C).
+        while True:
+            time.sleep(1)
+            if api_proc.poll() is not None or web_proc.poll() is not None:
+                break
+
+    finally:
+        _cleanup()
+
+
+def _organize_rename(config_path: Path, root_folder_id: Optional[str], execute: bool) -> None:
+    """Read saved orders and rename files in Drive sequentially."""
+    import asyncio
+    from pathlib import PurePosixPath as _PP
+
+    from rich.table import Table
+
+    from asset_db.models import PhotoOrder
+    from asset_db.session import get_sessionmaker
+    from asset_sdk.adapters import drive
+    from asset_sdk.config import PipelineConfig
+    from sqlalchemy import select
+
+    if not root_folder_id:
+        root_folder_id = os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID")
+    if not root_folder_id:
+        console.print("[red]GOOGLE_DRIVE_ROOT_FOLDER_ID is not set.[/red]")
+        raise typer.Exit(1)
+
+    cfg = PipelineConfig.load(config_path)
+    photos_subdir = cfg.paths.product_photos
+    structure = cfg.drive.structure
+
+    # Pull all saved orders from the DB.
+    async def _load_orders() -> list[PhotoOrder]:
+        Session = get_sessionmaker()
+        async with Session() as session:
+            res = await session.execute(select(PhotoOrder))
+            return list(res.scalars().all())
+
+    orders = asyncio.run(_load_orders())
+    if not orders:
+        console.print("[yellow]No saved photo orders found in the database.[/yellow]")
+        return
+
+    # Index SKU folders by name.
+    if structure == "flat":
+        sku_index = {name: ("", fid) for name, fid in drive.list_folders(root_folder_id).items()}
+    else:
+        sku_index = {}
+        for sup_name, sup_id in drive.list_folders(root_folder_id).items():
+            for name, fid in drive.list_folders(sup_id).items():
+                sku_index[name] = (sup_name, fid)
+
+    table = Table(title=f"Photo orders to apply ({len(orders)})")
+    table.add_column("Supplier")
+    table.add_column("SKU")
+    table.add_column("Photos", justify="right")
+    table.add_column("Status")
+
+    plans: list[tuple[str, str, str, list[tuple[str, str, str]]]] = []
+    # plan tuple: (supplier, sku, photos_folder_id, [(file_id, current_name, target_name), ...])
+
+    for order in orders:
+        supplier, sku_id = sku_index.get(order.sku, ("", None))
+        if sku_id is None:
+            table.add_row("", order.sku, str(len(order.items)), "[red]SKU folder not found[/red]")
+            continue
+        # Resolve photos subfolder
+        current = sku_id
+        photos_id: str | None = sku_id
+        for part in photos_subdir.split("/"):
+            children = drive.list_folders(current)
+            if part not in children:
+                photos_id = None
+                break
+            current = children[part]
+            photos_id = current
+        if photos_id is None:
+            table.add_row(supplier, order.sku, str(len(order.items)), "[red]photos/ not found[/red]")
+            continue
+
+        existing = {f["id"]: f["name"] for f in drive.list_files(photos_id)}
+
+        # Build the rename list for items still present.
+        renames: list[tuple[str, str, str]] = []
+        position = 0
+        for item in order.items:
+            fid = item.get("file_id")
+            if fid not in existing:
+                continue
+            position += 1
+            current_name = existing[fid]
+            ext = _PP(current_name).suffix.lower() or ".jpg"
+            target_name = f"{position}{ext}"
+            renames.append((fid, current_name, target_name))
+
+        plans.append((supplier, order.sku, photos_id, renames))
+        status = f"{len(renames)} → 1..{len(renames)}"
+        table.add_row(supplier, order.sku, str(len(order.items)), status)
+
+    console.print(table)
+
+    if not execute:
+        n = sum(len(p[3]) for p in plans)
+        console.print(
+            f"\n[bold]Dry run complete[/bold] — pass --execute to rename {n} files."
+        )
+        return
+
+    bar = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=30),
+        MofNCompleteColumn(),
+        console=console,
+    )
+    total = sum(len(p[3]) for p in plans)
+    if total == 0:
+        console.print("[yellow]Nothing to rename.[/yellow]")
+        return
+    renamed = errored = 0
+    with bar:
+        bar_task = bar.add_task("Renaming…", total=total, completed=0)
+        # Two-phase rename to avoid name collisions: first to a temp prefix, then to final.
+        TEMP_PREFIX = "__reorder_tmp__"
+        for supplier, sku, _, renames in plans:
+            # Phase 1: rename each to a temp name.
+            for fid, current, target in renames:
+                try:
+                    drive.rename_item(fid, f"{TEMP_PREFIX}{target}")
+                except Exception as exc:
+                    errored += 1
+                    bar.update(
+                        bar_task,
+                        description=f"  [red]err[/red] {sku}/{current}: {exc}",
+                        advance=0,
+                    )
+            # Phase 2: rename from temp to final.
+            for fid, current, target in renames:
+                try:
+                    drive.rename_item(fid, target)
+                    renamed += 1
+                    bar.update(
+                        bar_task,
+                        description=f"  [green]ok[/green] {sku}/{current} → {target}",
+                        advance=1,
+                    )
+                except Exception as exc:
+                    errored += 1
+                    bar.update(
+                        bar_task,
+                        description=f"  [red]err[/red] {sku}/{current}: {exc}",
+                        advance=1,
+                    )
+
+    console.print(
+        f"\n[bold]Rename complete[/bold]  ({renamed} renamed, {errored} errored)"
     )
 
 

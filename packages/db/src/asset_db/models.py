@@ -220,6 +220,26 @@ class DiagnosticFinding(Base):
     )
 
 
+class PhotoOrder(Base):
+    """Saved photo order for a SKU's product_photos folder.
+
+    Written by the `organize` web UI after a drag-and-drop reorder, then read
+    by `asset organize --rename --execute` to rename files in Drive sequentially.
+    """
+
+    __tablename__ = "photo_orders"
+
+    sku: Mapped[str] = mapped_column(String(128), primary_key=True)
+    asset_kind: Mapped[str] = mapped_column(
+        String(32), primary_key=True, default="product_photo"
+    )
+    # [{"file_id": "...", "name": "..."}] in display order (position = index).
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    saved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class EntityDraft(Base):
     """Pending UI changeset for an entity. MVP: single-user, one draft per entity."""
 

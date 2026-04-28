@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
+import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Asset Pipeline",
+  title: "Asset Pipeline — Organize",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

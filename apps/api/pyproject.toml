@@ -5,9 +5,12 @@ description = "FastAPI service for the asset optimization pipeline"
 requires-python = ">=3.12"
 dependencies = [
     "asset-sdk",
+    "asset-db",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.29",
     "python-dotenv>=1.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "psycopg[binary]>=3.2",
 ]
 
 [build-system]

@@ -5,6 +5,7 @@ description = "Monorepo root for the asset optimization pipeline"
 requires-python = ">=3.12"
 dependencies = [
     "asset-cli",
+    "asset-api",
 ]
 
 [tool.uv.workspace]
@@ -14,6 +15,7 @@ members = ["packages/*", "apps/cli", "apps/api"]
 asset-db  = { workspace = true }
 asset-sdk = { workspace = true }
 asset-cli = { workspace = true }
+asset-api = { workspace = true }
 
 [dependency-groups]
 dev = [
