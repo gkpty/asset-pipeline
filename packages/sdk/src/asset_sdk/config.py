@@ -39,6 +39,8 @@ class ModelsConfig:
 @dataclass
 class ScaffoldConfig:
     report_tab:         str = "Scaffold Report"
+    # Fallback folder name used by `scaffold --clean --move` when GOOGLE_DRIVE_MOVED_FOLDER_ID
+    # is not set in the environment. Created/found under the products root.
     moved_folder_name:  str = "MOVED_FOLDER"
     typo_cutoff:        float = 0.65
 

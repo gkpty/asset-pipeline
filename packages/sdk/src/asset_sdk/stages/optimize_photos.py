@@ -309,9 +309,11 @@ def to_sheet_rows(
         if a.current_size_bytes > cfg.max_file_mb * 1024 * 1024:
             actions.append(f"compress (currently {_human_mb(a.current_size_bytes)})")
 
-        # =IMAGE(url, mode, height_px, width_px) — mode 4 = explicit pixel size.
-        preview_url = f"https://drive.google.com/thumbnail?id={a.file_id}&sz=w200"
-        preview = f'=IMAGE("{preview_url}", 4, 100, 100)'
+        # Mode 1 (default) fits the image to the cell while preserving aspect ratio.
+        # Combined with the row-height bump applied by the CLI after the write, this
+        # gives a roughly 120px-tall thumbnail with whatever width the column has.
+        preview_url = f"https://drive.google.com/thumbnail?id={a.file_id}&sz=w400"
+        preview = f'=IMAGE("{preview_url}")'
 
         if a.current_padding_pct is None:
             pad_str = "—"

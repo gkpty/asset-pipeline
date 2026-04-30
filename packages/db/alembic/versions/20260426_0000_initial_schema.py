@@ -17,6 +17,33 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+# Define the PG enum types with their values + create_type=False so SQLAlchemy doesn't
+# try to (re-)create them when columns of these types are added to tables. We create
+# them explicitly via op.execute below so the values are guaranteed correct.
+ENTITY_KIND = postgresql.ENUM(
+    "product", "category", "designer", "collection",
+    name="entitykind", create_type=False,
+)
+ASSET_KIND = postgresql.ENUM(
+    "product_photo", "lifestyle_photo", "website_thumbnail", "system_thumbnail",
+    "video", "diagram", "model_dwg", "model_obj", "model_gltf", "model_skp",
+    "assembly_instructions", "carton_layout", "barcode",
+    name="assetkind", create_type=False,
+)
+ASSET_STATUS = postgresql.ENUM(
+    "pending", "ok", "failed", "sync_pending",
+    name="assetstatus", create_type=False,
+)
+RUN_STATUS = postgresql.ENUM(
+    "running", "succeeded", "failed", "partial",
+    name="runstatus", create_type=False,
+)
+STAGE_STATUS = postgresql.ENUM(
+    "running", "succeeded", "failed", "skipped",
+    name="stagestatus", create_type=False,
+)
+
+
 def upgrade() -> None:
     op.execute("CREATE TYPE entitykind AS ENUM ('product', 'category', 'designer', 'collection')")
     op.execute(
@@ -32,7 +59,7 @@ def upgrade() -> None:
     op.create_table(
         "entities",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("kind", sa.Enum(name="entitykind", create_type=False), nullable=False),
+        sa.Column("kind", ENTITY_KIND, nullable=False),
         sa.Column("sku", sa.String(128), nullable=False),
         sa.Column("name", sa.Text(), nullable=True),
         sa.Column("supplier", sa.String(128), nullable=True),
@@ -48,7 +75,7 @@ def upgrade() -> None:
         "assets",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("entity_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("kind", sa.Enum(name="assetkind", create_type=False), nullable=False),
+        sa.Column("kind", ASSET_KIND, nullable=False),
         sa.Column("sequence", sa.Integer(), nullable=False),
         sa.Column("source_path", sa.Text(), nullable=True),
         sa.Column("dest_path", sa.Text(), nullable=True),
@@ -58,12 +85,7 @@ def upgrade() -> None:
         sa.Column("height", sa.Integer(), nullable=True),
         sa.Column("format", sa.String(16), nullable=True),
         sa.Column("bytes", sa.BigInteger(), nullable=True),
-        sa.Column(
-            "status",
-            sa.Enum(name="assetstatus", create_type=False),
-            nullable=False,
-            server_default="pending",
-        ),
+        sa.Column("status", ASSET_STATUS, nullable=False, server_default="pending"),
         sa.Column("last_synced_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("metadata", postgresql.JSONB(), nullable=False, server_default="{}"),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
@@ -79,12 +101,7 @@ def upgrade() -> None:
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column(
-            "status",
-            sa.Enum(name="runstatus", create_type=False),
-            nullable=False,
-            server_default="running",
-        ),
+        sa.Column("status", RUN_STATUS, nullable=False, server_default="running"),
         sa.Column("triggered_by", sa.String(32), nullable=True),
         sa.Column("source_config", postgresql.JSONB(), nullable=False, server_default="{}"),
         sa.Column("dest_config", postgresql.JSONB(), nullable=False, server_default="{}"),
@@ -106,12 +123,7 @@ def upgrade() -> None:
         sa.Column("stage", sa.String(64), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column(
-            "status",
-            sa.Enum(name="stagestatus", create_type=False),
-            nullable=False,
-            server_default="running",
-        ),
+        sa.Column("status", STAGE_STATUS, nullable=False, server_default="running"),
         sa.Column("metrics", postgresql.JSONB(), nullable=False, server_default="{}"),
         sa.ForeignKeyConstraint(["run_id"], ["pipeline_runs.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),

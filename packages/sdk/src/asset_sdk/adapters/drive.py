@@ -195,12 +195,7 @@ def list_children(folder_id: str) -> list[dict[str, str]]:
 
 
 def list_files(folder_id: str) -> list[dict[str, str]]:
-    """Return [{id, name, thumbnailLink}, ...] for all non-folder, non-trashed files.
-
-    thumbnailLink is a short-lived (~hours) pre-signed URL that loads without browser
-    cookies — much more reliable for embedding in a web UI than drive.google.com/thumbnail.
-    Field is missing for files Drive hasn't generated a thumbnail for.
-    """
+    """Return [{id, name}, ...] for all non-folder, non-trashed files in folder_id."""
     svc = _service()
     result: list[dict[str, str]] = []
     page_token: str | None = None
@@ -210,7 +205,7 @@ def list_files(folder_id: str) -> list[dict[str, str]]:
             svc.files()
             .list(
                 q=q,
-                fields="nextPageToken, files(id, name, thumbnailLink)",
+                fields="nextPageToken, files(id, name)",
                 pageToken=page_token,
                 pageSize=1000,
                 **_SD,

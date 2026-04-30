@@ -168,6 +168,38 @@ input[type="text"] {
   text-align: center;
 }
 
+.photo-card .delete-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  border: none;
+  background: rgba(220, 38, 38, 0.85);  /* red */
+  color: white;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, transform 0.1s;
+  z-index: 5;
+}
+
+.photo-card:hover .delete-btn {
+  opacity: 1;
+}
+
+.photo-card .delete-btn:hover {
+  background: rgb(185, 28, 28);
+  transform: scale(1.08);
+}
+
 .photo-card .name {
   padding: 8px 10px;
   font-size: 11px;
@@ -183,6 +215,69 @@ input[type="text"] {
   text-align: center;
   padding: 60px 20px;
   color: #888;
+}
+
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(245, 245, 245, 0.92);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  z-index: 50;
+}
+
+.loading-overlay .label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #444;
+}
+
+.loading-overlay .sub {
+  font-size: 12px;
+  color: #888;
+  max-width: 360px;
+  text-align: center;
+}
+
+.loading-bar {
+  width: 320px;
+  height: 6px;
+  background: #e5e5e5;
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.loading-bar::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -40%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, #2563eb, transparent);
+  animation: loading-bar-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes loading-bar-slide {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+
+.error-box {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin: 16px 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .toast {

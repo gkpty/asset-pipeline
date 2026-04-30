@@ -664,15 +664,19 @@ def dedupe(
         table = Table(title=f"Planned dedupe actions ({len(plans)})")
         table.add_column("Action", style="bold")
         table.add_column("Duplicate")
+        table.add_column("Duplicate ID", style="dim")
         table.add_column("→")
         table.add_column("Primary")
+        table.add_column("Primary ID", style="dim")
         for p in plans:
             colour = "red" if p.action == "DELETE" else "yellow"
             table.add_row(
                 f"[{colour}]{p.action}[/{colour}]",
                 f"{p.supplier}/{p.sku}",
+                p.dup_folder_id,
                 "→",
                 f"{p.primary_supplier}/{p.sku}",
+                p.primary_folder_id,
             )
         console.print(table)
     else:
@@ -1004,7 +1008,11 @@ def optimize(
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
             t = progress.add_task(f"Writing report to '{_report_tab}'…", total=None)
             headers, rows = to_sheet_rows(analyses, opt_cfg)
-            write_report(sheet_id, _report_tab, headers, rows, value_input_option="USER_ENTERED")
+            write_report(
+                sheet_id, _report_tab, headers, rows,
+                value_input_option="USER_ENTERED",
+                row_height_px=120,
+            )
             progress.update(t, description=f"Report written → '{_report_tab}'")
             progress.stop_task(t)
 
@@ -1093,6 +1101,11 @@ def scaffold(
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID.",
+    ),
+    moved_folder_id: Optional[str] = typer.Option(
+        None, envvar="GOOGLE_DRIVE_MOVED_FOLDER_ID",
+        help="Drive folder ID to quarantine non-canonical dirs into (with --clean --move). "
+             "If empty, scaffold creates/finds scaffold.moved_folder_name under the products root.",
     ),
     tab: Optional[str] = typer.Option(
         None, help="Sheet tab with the SKU list. Defaults to csv.tab_name in config.",
@@ -1215,8 +1228,11 @@ def scaffold(
     applied = errored = 0
     with bar:
         bar_task = bar.add_task("Applying…", total=len(actionable_actions), completed=0)
-        for prog in run_scaffold(actions, root_folder_id, cfg.drive.structure,
-                                 cfg.scaffold.moved_folder_name):
+        for prog in run_scaffold(
+            actions, root_folder_id, cfg.drive.structure,
+            cfg.scaffold.moved_folder_name,
+            moved_folder_id or "",
+        ):
             a = prog.action
             if prog.error:
                 errored += 1
@@ -1238,8 +1254,8 @@ def scaffold(
     )
 
 
-@app.command("set-permissions")
-def set_permissions(
+@app.command("permissions")
+def permissions(
     asset_type: str = typer.Option(
         ..., "--type",
         help="Subfolder type to target (photo, lifestyle, video, diagram, models_obj, etc.).",
@@ -1261,6 +1277,10 @@ def set_permissions(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
         help="Google Drive products root folder ID.",
     ),
+    detailed: bool = typer.Option(
+        False, "--detailed",
+        help="Print one row per file (current → target access) instead of just summary counts.",
+    ),
     execute: bool = typer.Option(
         False, "--execute",
         help="Apply the permission changes. Omit for a dry run.",
@@ -1270,9 +1290,10 @@ def set_permissions(
     Set Drive file permissions on every file under <sku>/<type-subdir>/ recursively.
 
     Examples:
-      uv run asset set-permissions --type photo --access public --execute
-      uv run asset set-permissions --type models_obj --access private --execute
-      uv run asset set-permissions --type lifestyle --access public --supplier mansa --execute
+      uv run asset permissions --type photo --access public --execute
+      uv run asset permissions --type models_obj --access private --execute
+      uv run asset permissions --type lifestyle --access public --supplier mansa --execute
+      uv run asset permissions --type photo --access public --detailed
 
     public  = grants 'anyone with the link can view' to every file
     private = removes any 'anyone' permission, leaving only explicitly-shared users
@@ -1317,6 +1338,40 @@ def set_permissions(
         table.add_row("[yellow]Make private[/yellow]", str(counts["to_change"]))
     table.add_row("Already in target state", str(counts["no_change"]))
     console.print(table)
+
+    if detailed:
+        target_label = "anyone:reader" if access == "public" else "private"
+        detail = Table(title=f"Per-file plan ({len(targets)} files)")
+        detail.add_column("Supplier", style="cyan")
+        detail.add_column("SKU")
+        detail.add_column("File")
+        detail.add_column("Current")
+        detail.add_column("→")
+        detail.add_column("Target")
+        detail.add_column("Action", style="bold")
+        for t in targets:
+            current = (
+                f"anyone:{t.current_anyone_role}"
+                if t.current_anyone_role
+                else "private"
+            )
+            if access == "public":
+                action = (
+                    "[dim]no change[/dim]"
+                    if t.current_anyone_role == "reader"
+                    else "[green]make public[/green]"
+                )
+            else:
+                action = (
+                    "[dim]no change[/dim]"
+                    if t.current_anyone_role is None
+                    else "[yellow]make private[/yellow]"
+                )
+            detail.add_row(
+                t.supplier, t.sku, t.file_name,
+                current, "→", target_label, action,
+            )
+        console.print(detail)
 
     if not execute:
         console.print(

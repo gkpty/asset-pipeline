@@ -35,8 +35,8 @@ report_tab = "Models Report"
 
 [scaffold]
 report_tab        = "Scaffold Report"
-moved_folder_name = "MOVED_FOLDER"
-typo_cutoff       = 0.65          # difflib similarity above which a folder name is treated as a typo
+moved_folder_name = "MOVED_FOLDER"             # fallback name used only if GOOGLE_DRIVE_MOVED_FOLDER_ID env var is unset
+typo_cutoff       = 0.65                       # difflib similarity above which a folder name is treated as a typo
 
 [optimize]
 # --- Photo settings ---

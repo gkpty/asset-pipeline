@@ -15,9 +15,10 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { use, useCallback, useEffect, useState } from "react";
 import {
+  deletePhoto,
   fetchSkuPhotos,
   saveOrder,
   type PhotoItem,
@@ -27,9 +28,11 @@ import {
 function PhotoCard({
   photo,
   position,
+  onDelete,
 }: {
   photo: PhotoItem;
   position: number;
+  onDelete: (fileId: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: photo.file_id });
@@ -48,9 +51,24 @@ function PhotoCard({
       className={`photo-card${isDragging ? " dragging" : ""}`}
     >
       <div className="position">{position}</div>
+      <button
+        type="button"
+        className="delete-btn"
+        title={`Delete ${photo.name}`}
+        // Stop the drag from picking this up on click.
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (window.confirm(`Move "${photo.name}" to Drive trash?`)) {
+            onDelete(photo.file_id);
+          }
+        }}
+      >
+        ×
+      </button>
       <div className="thumb">
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={photo.url} alt={photo.name} />
+        <img src={photo.url} alt={photo.name} referrerPolicy="no-referrer" />
       </div>
       <div className="name">{photo.name}</div>
     </div>
@@ -60,6 +78,7 @@ function PhotoCard({
 export default function SkuPage({ params }: { params: Promise<{ sku: string }> }) {
   const { sku } = use(params);
   const decodedSku = decodeURIComponent(sku);
+  const router = useRouter();
 
   const [data, setData] = useState<SkuPhotosResponse | null>(null);
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
@@ -105,6 +124,12 @@ export default function SkuPage({ params }: { params: Promise<{ sku: string }> }
         photos.map((p) => ({ file_id: p.file_id, name: p.name })),
       );
       setDirty(false);
+      // Drop home-grid cache so the saved-order's first photo is shown on return.
+      try {
+        sessionStorage.removeItem("skus_cache_v1");
+      } catch {
+        /* ignore */
+      }
       setToast("Order saved");
     } catch (e) {
       setToast(`Save failed: ${e}`);
@@ -120,11 +145,45 @@ export default function SkuPage({ params }: { params: Promise<{ sku: string }> }
     }
   }, [data]);
 
+  const handleDelete = useCallback(async (fileId: string) => {
+    try {
+      await deletePhoto(fileId);
+      setPhotos((items) => items.filter((p) => p.file_id !== fileId));
+      // Also drop from the cached `data` so Reset won't bring it back.
+      setData((d) =>
+        d ? { ...d, photos: d.photos.filter((p) => p.file_id !== fileId) } : d,
+      );
+      // Invalidate the home grid's sessionStorage cache so its thumbnail refreshes
+      // when the user goes back (next mount triggers a fresh fetchSkus anyway).
+      try {
+        sessionStorage.removeItem("skus_cache_v1");
+      } catch {
+        /* ignore */
+      }
+      setToast("Photo deleted");
+    } catch (e) {
+      setToast(`Delete failed: ${e}`);
+    }
+  }, []);
+
   return (
     <>
       <header className="header">
         <div>
-          <Link href="/" style={{ fontSize: 13, color: "#666" }}>← All SKUs</Link>
+          <a
+            href="/"
+            onClick={(e) => {
+              // Prefer router.back() so the home page restores from cache + scroll;
+              // fall through to a normal nav if there's no history (direct URL load).
+              if (window.history.length > 1) {
+                e.preventDefault();
+                router.back();
+              }
+            }}
+            style={{ fontSize: 13, color: "#666", cursor: "pointer" }}
+          >
+            ← All SKUs
+          </a>
           <h1 style={{ marginTop: 4 }}>{decodedSku}</h1>
           {data && (
             <div className="meta">
@@ -143,9 +202,15 @@ export default function SkuPage({ params }: { params: Promise<{ sku: string }> }
         </div>
       </header>
 
+      {!data && !error && (
+        <div className="loading-overlay">
+          <div className="loading-bar" />
+          <div className="label">Loading photos for {decodedSku}…</div>
+        </div>
+      )}
+
       <main className="container">
-        {error && <p style={{ color: "red" }}>Error: {error}</p>}
-        {!data && !error && <p>Loading…</p>}
+        {error && <div className="error-box">Error: {error}</div>}
 
         {data && photos.length === 0 && (
           <div className="empty">No photos in this SKU's photos/ folder.</div>
@@ -163,7 +228,12 @@ export default function SkuPage({ params }: { params: Promise<{ sku: string }> }
             >
               <div className="photo-grid">
                 {photos.map((p, i) => (
-                  <PhotoCard key={p.file_id} photo={p} position={i + 1} />
+                  <PhotoCard
+                    key={p.file_id}
+                    photo={p}
+                    position={i + 1}
+                    onDelete={handleDelete}
+                  />
                 ))}
               </div>
             </SortableContext>

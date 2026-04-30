@@ -21,6 +21,8 @@ class SkuRow:
     suggested_action: str             # DELETE | MERGE — only set when is_duplicate=True
     issues: str
     dir_counts: dict[str, int] = field(default_factory=dict)
+    loose_file_count: int = 0         # non-hidden files sitting at the SKU root (should be moved by scaffold --fix)
+    unknown_folder_count: int = 0     # subfolders at the SKU root that aren't part of paths.input
 
 
 @dataclass
@@ -50,6 +52,19 @@ def _resolve_and_count(
 
 def _label(supplier: str, sku: str) -> str:
     return f"{supplier}/{sku}" if supplier else sku
+
+
+def _append_root_notes(issues: str, loose: int, unknown: int) -> str:
+    """Append `; N loose files at root; M unknown subfolders` when either is non-zero."""
+    notes: list[str] = []
+    if loose:
+        notes.append(f"{loose} loose file{'s' if loose != 1 else ''} at root")
+    if unknown:
+        notes.append(f"{unknown} unknown subfolder{'s' if unknown != 1 else ''}")
+    if not notes:
+        return issues
+    suffix = "; ".join(notes)
+    return f"{issues}; {suffix}" if issues else suffix
 
 
 @dataclass
@@ -102,6 +117,12 @@ def _compare_contents(
       6. Otherwise → MERGE
     """
     n_p, n_d = len(primary), len(dup)
+
+    # Tier 0 — empty duplicate is always safe to delete (nothing to merge).
+    if n_d == 0:
+        if n_p == 0:
+            return "DELETE", "Both folders empty (0 files)"
+        return "DELETE", f"Duplicate is empty ({n_p} files only in primary)"
 
     # Tier 1
     if sorted((f.size, f.md5) for f in primary) == sorted((f.size, f.md5) for f in dup):
@@ -222,7 +243,11 @@ def run(
 
     folder_cache: dict[str, dict[str, str]] = {}
 
-    def _diag(folder_id: str) -> tuple[dict[str, int], list[str]]:
+    # First-segment of every canonical path (e.g. "models/dwg" → "models").
+    canonical_top: set[str] = {entry[2].split("/")[0] for entry in paths.entries()}
+
+    def _diag(folder_id: str) -> tuple[dict[str, int], list[str], int, int]:
+        """Returns (dir_counts, missing_subdirs, loose_file_count, unknown_folder_count)."""
         dir_counts: dict[str, int] = {}
         missing_subdirs: list[str] = []
         for key, _display, rel_path in paths.entries():
@@ -232,7 +257,17 @@ def run(
                 dir_counts[key] = 0
             else:
                 dir_counts[key] = count
-        return dir_counts, missing_subdirs
+
+        loose_files = 0
+        unknown_folders = 0
+        for child in drive.list_children(folder_id):
+            if child["kind"] == "file":
+                if not child["name"].startswith("."):
+                    loose_files += 1
+            else:  # folder
+                if child["name"] not in canonical_top:
+                    unknown_folders += 1
+        return dir_counts, missing_subdirs, loose_files, unknown_folders
 
     rows: list[SkuRow] = []
     missing_sheet_skus: list[str] = []  # populated during pass 1, used for orphan suggestions in pass 2
@@ -256,15 +291,17 @@ def run(
         locations = groups[sku]
         pidx = primary_idx_by_sku[sku]
         primary_sup, primary_id = locations[pidx]
-        counts, missing_subdirs = _diag(primary_id)
+        counts, missing_subdirs, loose, unknown = _diag(primary_id)
 
         status = "INCOMPLETE" if missing_subdirs else "OK"
         issues = ("Missing: " + ", ".join(missing_subdirs)) if missing_subdirs else ""
+        issues = _append_root_notes(issues, loose, unknown)
 
         rows.append(SkuRow(
             sku=sku, supplier=primary_sup, status=status,
             is_duplicate=False, suggested_rename="", suggested_action="",
             issues=issues, dir_counts=counts,
+            loose_file_count=loose, unknown_folder_count=unknown,
         ))
 
         # Duplicate occurrences for this sheet SKU
@@ -274,13 +311,15 @@ def run(
             for i, (sup, fid) in enumerate(locations):
                 if i == pidx:
                     continue
-                dup_counts, _ = _diag(fid)
+                dup_counts, _, dup_loose, dup_unknown = _diag(fid)
                 action, reason = _compare_contents(primary_files, _collect_files(fid))
                 iss = f"vs {primary_label}: {reason}"
+                iss = _append_root_notes(iss, dup_loose, dup_unknown)
                 rows.append(SkuRow(
                     sku=sku, supplier=sup, status=status,
                     is_duplicate=True, suggested_rename="", suggested_action=action,
                     issues=iss, dir_counts=dup_counts,
+                    loose_file_count=dup_loose, unknown_folder_count=dup_unknown,
                 ))
 
     # ---------- Pass 2: orphan SKUs (in drive, not in sheet) ----------
@@ -289,7 +328,7 @@ def run(
         locations = groups[sku]
         pidx = primary_idx_by_sku[sku]
         primary_sup, primary_id = locations[pidx]
-        counts, _ = _diag(primary_id)
+        counts, _, loose, unknown = _diag(primary_id)
 
         suggestion = ""
         if missing_sheet_skus:
@@ -297,10 +336,12 @@ def run(
             if matches:
                 suggestion = matches[0]
 
+        issues = _append_root_notes("Not in sheet", loose, unknown)
         rows.append(SkuRow(
             sku=sku, supplier=primary_sup, status="ORPHAN DIR",
             is_duplicate=False, suggested_rename=suggestion, suggested_action="",
-            issues="Not in sheet", dir_counts=counts,
+            issues=issues, dir_counts=counts,
+            loose_file_count=loose, unknown_folder_count=unknown,
         ))
 
         if len(locations) > 1:
@@ -309,13 +350,15 @@ def run(
             for i, (sup, fid) in enumerate(locations):
                 if i == pidx:
                     continue
-                dup_counts, _ = _diag(fid)
+                dup_counts, _, dup_loose, dup_unknown = _diag(fid)
                 action, reason = _compare_contents(primary_files, _collect_files(fid))
                 iss = f"vs {primary_label}: {reason}; not in sheet"
+                iss = _append_root_notes(iss, dup_loose, dup_unknown)
                 rows.append(SkuRow(
                     sku=sku, supplier=sup, status="ORPHAN DIR",
                     is_duplicate=True, suggested_rename=suggestion, suggested_action=action,
                     issues=iss, dir_counts=dup_counts,
+                    loose_file_count=dup_loose, unknown_folder_count=dup_unknown,
                 ))
 
     return DiagnoseReport(rows=rows)
@@ -330,11 +373,13 @@ def to_sheet_rows(
     headers = [
         "SKU", "Supplier", "Status", "isDuplicate",
         "Suggested Rename", "Suggested Action", "Issues",
+        "Total", "Loose Files at Root", "Unknown Subfolders",
     ] + dir_headers
 
     rows: list[list] = []
     for r in report.rows:
         counts = [r.dir_counts.get(key, 0) for key, _d, _p in entries]
+        total = sum(counts) + r.loose_file_count
         rows.append([
             r.sku,
             r.supplier,
@@ -343,6 +388,9 @@ def to_sheet_rows(
             r.suggested_rename,
             r.suggested_action,
             r.issues,
+            total,
+            r.loose_file_count,
+            r.unknown_folder_count,
             *counts,
         ])
 

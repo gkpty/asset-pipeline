@@ -166,16 +166,17 @@ def build_plan(
         # 3b. Typo / wrong-case rename
         renamed_to: dict[str, str] = {}  # old_name → canonical_name (so subsequent steps see the rename)
         if fix:
-            existing_lower = {n.lower() for n in existing_subdirs.keys()}
             canonical_list = [c.lower() for c in canonical_top]
+            # Track targets that are already taken (either pre-existing OR claimed by an earlier rename).
+            taken_targets: set[str] = set(existing_subdirs.keys())
             for name, fid in list(existing_subdirs.items()):
                 if name in canonical_top:
                     continue
+                # Wrong-case match (e.g. "Photos" → "photos")
                 if name.lower() in canonical_top_lower and name != canonical_top_lower[name.lower()]:
-                    # Wrong-case match (e.g. "Photos" → "photos")
                     canonical = canonical_top_lower[name.lower()]
-                    if canonical.lower() in existing_lower and canonical != name:
-                        # Both versions exist — flagged as duplicate above; skip rename
+                    if canonical in taken_targets and canonical != name:
+                        # The properly-named folder already exists alongside the wrong-case one.
                         continue
                     actions.append(Action(
                         kind="RENAME_DIR", sku=sku, supplier=supplier,
@@ -183,20 +184,25 @@ def build_plan(
                         src_id=fid, src_name=name, target_name=canonical,
                     ))
                     renamed_to[name] = canonical
+                    taken_targets.discard(name)
+                    taken_targets.add(canonical)
                     continue
                 # Fuzzy match against canonical names
                 matches = get_close_matches(name.lower(), canonical_list, n=1, cutoff=typo_cutoff)
                 if not matches:
                     continue
                 canonical = canonical_top_lower[matches[0]]
-                if canonical.lower() in existing_lower:
-                    continue  # canonical already exists — leave the typo alone
+                if canonical in taken_targets:
+                    # Either the canonical already exists, or another rename has claimed it this run.
+                    continue
                 actions.append(Action(
                     kind="RENAME_DIR", sku=sku, supplier=supplier,
                     description=f"Rename '{name}/' → '{canonical}/' (typo fix)",
                     src_id=fid, src_name=name, target_name=canonical,
                 ))
                 renamed_to[name] = canonical
+                taken_targets.discard(name)
+                taken_targets.add(canonical)
 
         # Apply renames to the local view so CREATE_SUBDIR / DELETE_DIR see post-rename state.
         for old, new in renamed_to.items():
@@ -309,6 +315,7 @@ def execute(
     root_folder_id: str,
     structure: str,
     moved_folder_name: str = "MOVED_FOLDER",
+    moved_folder_id: str = "",
 ) -> Generator[ScaffoldProgress, None, None]:
     """Execute actions in the safe priority order."""
     sorted_actions = sorted(
@@ -331,7 +338,9 @@ def execute(
             for name, fid in drive.list_folders(sup_id).items():
                 sku_id_cache[(name, sup_name)] = fid
 
-    moved_root_id: str | None = None
+    # If a specific Drive folder ID was passed, use it; otherwise lazily find/create
+    # `moved_folder_name` under the products root on first MOVE_DIR.
+    moved_root_id: str | None = moved_folder_id or None
     moved_category_cache: dict[str, str] = {}
 
     for i, a in enumerate(actionable, 1):

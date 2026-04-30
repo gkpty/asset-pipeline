@@ -19,6 +19,8 @@ from pydantic import BaseModel
 # Load .env before importing the SDK (which reads OAuth creds at module import).
 load_dotenv()
 
+from sqlalchemy import select
+
 from asset_db.models import PhotoOrder
 from asset_db.session import get_sessionmaker
 from asset_sdk.adapters import drive
@@ -57,27 +59,16 @@ def _resolve_subfolder(parent_id: str, rel_path: str) -> str | None:
     return current
 
 
-def _resize_thumbnail(url: str | None, size_px: int) -> str | None:
-    """Optionally bump the size suffix on a Drive thumbnailLink (=sNNN).
-
-    We're conservative here — only modify when the URL clearly ends in a numeric size
-    suffix; otherwise return as-is. Tokens inside Drive thumbnail URLs can contain '=s'
-    sequences, so naive splitting breaks them.
-    """
-    import re
-    if not url:
-        return None
-    m = re.search(r"=s\d+(-[a-zA-Z0-9]+)?$", url)
-    if m:
-        return url[: m.start()] + f"=s{size_px}"
-    return url
+def _thumb_url(file_id: str, size_px: int = 400) -> str:
+    """Drive's simple thumbnail URL — works when the browser is logged into Google
+    or when the file is publicly readable."""
+    return f"https://drive.google.com/thumbnail?id={file_id}&sz=w{size_px}"
 
 
 def _scan_one_sku(sku: str, sku_id: str, supplier: str, photos_subdir: str) -> dict:
     """Resolve <sku>/<photos_subdir>, count files, pick the first as the thumbnail."""
     photos_id = _resolve_subfolder(sku_id, photos_subdir)
     first_photo_id: str | None = None
-    first_thumb_url: str | None = None
     photo_count = 0
     if photos_id:
         files = [f for f in drive.list_files(photos_id) if not f["name"].startswith(".")]
@@ -85,7 +76,6 @@ def _scan_one_sku(sku: str, sku_id: str, supplier: str, photos_subdir: str) -> d
         photo_count = len(files)
         if files:
             first_photo_id = files[0]["id"]
-            first_thumb_url = files[0].get("thumbnailLink")
     return {
         "sku": sku,
         "supplier": supplier,
@@ -93,7 +83,6 @@ def _scan_one_sku(sku: str, sku_id: str, supplier: str, photos_subdir: str) -> d
         "photos_folder_id": photos_id,
         "photo_count": photo_count,
         "first_photo_id": first_photo_id,
-        "first_thumb_url": first_thumb_url,
     }
 
 
@@ -131,11 +120,8 @@ def _scan_skus() -> list[dict]:
                 print(f"[skus]   {i}/{len(sku_tuples)} done", flush=True)
 
     out.sort(key=lambda x: (x["supplier"], x["sku"]))
-    with_thumb = sum(1 for x in out if x.get("first_thumb_url"))
-    print(
-        f"[skus] Done. {with_thumb}/{len(out)} SKUs have a Drive thumbnailLink",
-        flush=True,
-    )
+    with_photos = sum(1 for x in out if x["first_photo_id"])
+    print(f"[skus] Done. {with_photos}/{len(out)} SKUs have at least one photo", flush=True)
     return out
 
 
@@ -179,23 +165,41 @@ class OrderRequest(BaseModel):
     items: list[OrderItem]
 
 
-def _fallback_thumb(file_id: str, w: int = 400) -> str:
-    """Last-resort URL — works only if the file is public OR the browser is logged into Drive."""
-    return f"https://drive.google.com/thumbnail?id={file_id}&sz=w{w}"
-
-
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     return {"status": "ok", "cache_size": len(state.skus_cache or [])}
+
+
+async def _apply_saved_orders(items: list[dict]) -> None:
+    """Override each entry's first_photo_id with the saved order's first item, if any."""
+    try:
+        Session = get_sessionmaker()
+        async with Session() as session:
+            rows = (await session.execute(select(PhotoOrder))).scalars().all()
+        by_sku = {o.sku: o for o in rows}
+        for entry in items:
+            order = by_sku.get(entry["sku"])
+            if order and order.items:
+                first_id = order.items[0].get("file_id")
+                if first_id:
+                    entry["first_photo_id"] = first_id
+    except Exception as exc:
+        print(f"[skus] Couldn't apply saved orders (DB unreachable?): {exc}", flush=True)
+
+
+async def _populate_cache() -> None:
+    print("[skus] Scanning products drive…", flush=True)
+    items = _scan_skus()
+    await _apply_saved_orders(items)
+    state.skus_cache = items
+    print(f"[skus] Cached {len(items)} SKUs", flush=True)
 
 
 @app.get("/api/skus", response_model=list[SkuListItem])
 async def list_skus(supplier: str | None = None) -> list[SkuListItem]:
     if state.skus_cache is None:
         try:
-            print("[skus] Scanning products drive…", flush=True)
-            state.skus_cache = _scan_skus()
-            print(f"[skus] Cached {len(state.skus_cache)} SKUs", flush=True)
+            await _populate_cache()
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -204,9 +208,7 @@ async def list_skus(supplier: str | None = None) -> list[SkuListItem]:
     for x in state.skus_cache:
         if supplier and x["supplier"].lower() != supplier.lower():
             continue
-        thumb = _resize_thumbnail(x.get("first_thumb_url"), 400)
-        if not thumb and x["first_photo_id"]:
-            thumb = _fallback_thumb(x["first_photo_id"], 400)
+        thumb = _thumb_url(x["first_photo_id"], 400) if x["first_photo_id"] else None
         out.append(SkuListItem(
             sku=x["sku"], supplier=x["supplier"],
             photo_count=x["photo_count"],
@@ -217,51 +219,70 @@ async def list_skus(supplier: str | None = None) -> list[SkuListItem]:
 
 @app.post("/api/refresh", response_model=dict)
 async def refresh() -> dict[str, Any]:
-    state.skus_cache = _scan_skus()
-    return {"sku_count": len(state.skus_cache)}
+    await _populate_cache()
+    return {"sku_count": len(state.skus_cache or [])}
 
 
 @app.get("/api/skus/{sku}/photos", response_model=SkuPhotosResponse)
 async def get_sku_photos(sku: str) -> SkuPhotosResponse:
-    items = state.skus_cache or _scan_skus()
-    sku_entry = next((x for x in items if x["sku"] == sku), None)
+    if state.skus_cache is None:
+        try:
+            state.skus_cache = _scan_skus()
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(500, f"Drive scan failed: {exc}")
+    sku_entry = next((x for x in state.skus_cache if x["sku"] == sku), None)
     if not sku_entry:
-        raise HTTPException(404, f"SKU '{sku}' not found")
+        raise HTTPException(
+            404,
+            f"SKU '{sku}' not in the cache. "
+            f"If it was just uploaded, POST /api/refresh to re-scan.",
+        )
     if not sku_entry["photos_folder_id"]:
-        raise HTTPException(404, f"SKU '{sku}' has no photos/ folder")
+        raise HTTPException(
+            404,
+            f"SKU '{sku}' has no photos/ folder under '{_load_cfg().paths.product_photos}/'.",
+        )
 
     files = drive.list_files(sku_entry["photos_folder_id"])
     files = [f for f in files if not f["name"].startswith(".")]
     files_by_id = {f["id"]: f for f in files}
 
-    Session = get_sessionmaker()
     saved_at: str | None = None
     has_order = False
-    async with Session() as session:
-        rec = await session.get(PhotoOrder, (sku, "product_photo"))
-        if rec is not None:
-            has_order = True
-            saved_at = rec.saved_at.isoformat() if rec.saved_at else None
-            ordered: list[dict] = []
-            seen: set[str] = set()
-            for item in rec.items:
-                fid = item.get("file_id")
-                if fid in files_by_id:
-                    ordered.append(files_by_id[fid])
-                    seen.add(fid)
-            for f in files:
-                if f["id"] not in seen:
-                    ordered.append(f)
-            files = ordered
-        else:
-            files.sort(key=lambda f: f["name"])
+    try:
+        Session = get_sessionmaker()
+        async with Session() as session:
+            rec = await session.get(PhotoOrder, (sku, "product_photo"))
+            if rec is not None:
+                has_order = True
+                saved_at = rec.saved_at.isoformat() if rec.saved_at else None
+                ordered: list[dict] = []
+                seen: set[str] = set()
+                for item in rec.items:
+                    fid = item.get("file_id")
+                    if fid in files_by_id:
+                        ordered.append(files_by_id[fid])
+                        seen.add(fid)
+                for f in files:
+                    if f["id"] not in seen:
+                        ordered.append(f)
+                files = ordered
+            else:
+                files.sort(key=lambda f: f["name"])
+    except Exception as exc:
+        # DB unreachable — show photos in their natural order so the user can still view them.
+        # Saving will fail with a clearer error, which is acceptable.
+        print(f"[photos] DB unavailable, returning unordered: {exc}", flush=True)
+        files.sort(key=lambda f: f["name"])
+        has_order = False
+        saved_at = None
 
-    photo_items: list[PhotoItem] = []
-    for f in files:
-        thumb = _resize_thumbnail(f.get("thumbnailLink"), 600)
-        if not thumb:
-            thumb = _fallback_thumb(f["id"], 600)
-        photo_items.append(PhotoItem(file_id=f["id"], name=f["name"], url=thumb))
+    photo_items: list[PhotoItem] = [
+        PhotoItem(file_id=f["id"], name=f["name"], url=_thumb_url(f["id"], 600))
+        for f in files
+    ]
 
     return SkuPhotosResponse(
         sku=sku,
@@ -284,4 +305,43 @@ async def save_sku_order(sku: str, body: OrderRequest) -> dict[str, Any]:
         else:
             rec.items = items_payload
         await session.commit()
+
+    # Reflect the new "first photo" on the home grid immediately.
+    if state.skus_cache and items_payload:
+        for entry in state.skus_cache:
+            if entry["sku"] == sku:
+                entry["first_photo_id"] = items_payload[0]["file_id"]
+                break
+
     return {"sku": sku, "count": len(body.items)}
+
+
+@app.delete("/api/files/{file_id}", response_model=dict)
+async def delete_file(file_id: str) -> dict[str, Any]:
+    """Move a single Drive file to trash. Updates the cache so the grid stays accurate."""
+    try:
+        drive.trash_item(file_id)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Drive trash failed: {exc}")
+
+    # Drop the file from any saved orders + adjust the home-grid cache.
+    if state.skus_cache:
+        for entry in state.skus_cache:
+            if entry.get("first_photo_id") == file_id:
+                entry["first_photo_id"] = None
+                entry["photo_count"] = max(0, entry.get("photo_count", 0) - 1)
+    try:
+        Session = get_sessionmaker()
+        async with Session() as session:
+            rows = (await session.execute(select(PhotoOrder))).scalars().all()
+            for rec in rows:
+                if any(it.get("file_id") == file_id for it in rec.items):
+                    rec.items = [it for it in rec.items if it.get("file_id") != file_id]
+            await session.commit()
+    except Exception as exc:
+        # DB might be down; the trash already happened.
+        print(f"[delete] Couldn't update saved orders: {exc}", flush=True)
+
+    return {"file_id": file_id, "trashed": True}
