@@ -32,6 +32,14 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const restored = useRef(false);
 
+  // Disable browser-native scroll restoration so it can't fight ours after
+  // a router.back(). We manage scroll position ourselves via sessionStorage.
+  useIsoLayoutEffect(() => {
+    if ("scrollRestoration" in window.history) {
+      window.history.scrollRestoration = "manual";
+    }
+  }, []);
+
   // First-paint hydration of cheap state (filter + cached SKU list, if any).
   // Scroll restoration happens in a separate effect that waits for SKUs.
   useIsoLayoutEffect(() => {
@@ -55,14 +63,20 @@ export default function Home() {
       .catch((e) => setError(String(e)));
   }, []);
 
-  // Restore scroll once SKUs are on the page — works both for cache hits
-  // (synchronously, before paint) AND for cache misses (after the fetch resolves).
-  // The `restored` ref ensures this only fires once per mount.
-  useIsoLayoutEffect(() => {
+  // Restore scroll once SKUs are on the page. We use a regular useEffect
+  // (not layoutEffect) + double rAF on purpose — this defers our scroll
+  // restoration past Next.js App Router's own scroll-restoration logic that
+  // fires synchronously around router.back(). Applying twice across frames
+  // gives us the last word, no matter what the framework did.
+  useEffect(() => {
     if (restored.current) return;
     if (!skus) return;
-    const y = sessionStorage.getItem(SCROLL_KEY);
-    if (y) window.scrollTo(0, parseInt(y, 10) || 0);
+    const raw = sessionStorage.getItem(SCROLL_KEY);
+    const target = raw ? parseInt(raw, 10) || 0 : 0;
+    requestAnimationFrame(() => {
+      window.scrollTo(0, target);
+      requestAnimationFrame(() => window.scrollTo(0, target));
+    });
     restored.current = true;
   }, [skus]);
 
@@ -72,21 +86,26 @@ export default function Home() {
     sessionStorage.setItem(FILTER_KEY, filter);
   }, [filter]);
 
-  // Save scroll position whenever the user scrolls (throttled via rAF).
+  // Track scrollY in real time. Persisting happens explicitly on Link click
+  // (see persistScroll below) — NOT on every scroll event, because nav-time
+  // scroll-to-0 events were racing the rAF debounce and overwriting the
+  // saved value with 0. We still save on pagehide as a safety net for tab
+  // close / hard reload.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    let pending = false;
-    const onScroll = () => {
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(() => {
-        sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
-        pending = false;
-      });
+    const onPageHide = () => {
+      sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
     };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
   }, []);
+
+  // Snapshot the scroll position immediately before navigating to a SKU.
+  // This is the deterministic save: it runs on user click, before any
+  // framework- or browser-driven scroll changes can race in.
+  const persistScroll = () => {
+    sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
+  };
 
   const filtered = useMemo(() => {
     if (!skus) return [];
@@ -140,6 +159,7 @@ export default function Home() {
               key={`${s.supplier}/${s.sku}`}
               href={`/sku/${encodeURIComponent(s.sku)}`}
               className="sku-card"
+              onClick={persistScroll}
             >
               <div className="thumb">
                 {s.first_photo_url ? (
