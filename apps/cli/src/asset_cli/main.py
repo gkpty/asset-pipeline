@@ -23,11 +23,16 @@ def init(
     ),
     folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive root folder ID containing the SKU folders.",
+        help="Google Drive parent folder ID (contains category subfolders like products/, materials/).",
+    ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root to verify (products, materials, …). Default: products.",
     ),
 ) -> None:
-    """Check credentials and confirm access to the Google Sheet and Drive folder."""
-    from asset_sdk.adapters.drive import get_item_name
+    """Check credentials and confirm access to the Google Sheet, the Drive parent
+    folder, and the requested category subfolder."""
+    from asset_sdk.adapters.drive import get_item_name, resolve_category_folder
     from asset_sdk.adapters.sheets import get_spreadsheet_title
 
     console.print("[bold]Checking Google credentials and resource access…[/bold]\n")
@@ -43,10 +48,21 @@ def init(
 
     try:
         name = get_item_name(folder_id)
-        console.print(f"[green]✓[/green] Drive folder found:  [bold]{name}[/bold]")
+        console.print(f"[green]✓[/green] Parent folder found:  [bold]{name}[/bold]")
         console.print(f"    ID: {folder_id}")
     except Exception as exc:
-        console.print(f"[red]✗[/red] Drive folder not accessible: {exc}")
+        console.print(f"[red]✗[/red] Parent folder not accessible: {exc}")
+
+    console.print()
+
+    try:
+        category_id = resolve_category_folder(folder_id, category)
+        console.print(
+            f"[green]✓[/green] Category subfolder found:  [bold]{category}[/bold]"
+        )
+        console.print(f"    ID: {category_id}")
+    except Exception as exc:
+        console.print(f"[red]✗[/red] Category subfolder {category!r} not found: {exc}")
 
 
 @app.command()
@@ -58,14 +74,18 @@ def diagnose(
     ),
     folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive root folder ID.",
+        help="Google Drive parent folder ID (contains category subfolders).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID.",
     ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
     tab: Optional[str] = typer.Option(
-        None, help="Sheet tab with the SKU list. Defaults to csv.tab_name in config.",
+        None, help="Sheet tab with the SKU list. Defaults to the category name.",
     ),
     sku_col: Optional[str] = typer.Option(
         None, help="SKU column header. Defaults to csv.sku_column in config.",
@@ -74,25 +94,28 @@ def diagnose(
         None, help="Supplier column header. Defaults to csv.supplier_column in config.",
     ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Tab to write the report into. Defaults to diagnose.report_tab in config.",
+        None, help="Tab to write the report into. Defaults to '<diagnose.report_tab> - <Category>'.",
     ),
 ) -> None:
     """
-    Scan a Google Drive products folder and report its structure against
-    a Google Sheets SKU list. Most options default to values in pipeline.config.toml.
+    Scan a Google Drive category folder (products/materials/...) and report its
+    structure against a Google Sheets SKU list. Most options default to values
+    in pipeline.config.toml.
     """
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows, write_report
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.diagnose import run, to_sheet_rows
 
     cfg = PipelineConfig.load(config_path)
+    category_folder_id = drive.resolve_category_folder(folder_id, category)
 
-    # Resolve: CLI flag → config → (already has a hardcoded default in config dataclass)
-    _tab          = tab          or cfg.csv.tab_name
+    # Resolve: CLI flag → category default → config default
+    _tab          = tab          or category
     _sku_col      = sku_col      or cfg.csv.sku_column
     _supplier_col = supplier_col or cfg.csv.supplier_column
-    _report_tab   = report_tab   or cfg.diagnose.report_tab
-    _structure    = cfg.drive.structure
+    _report_tab   = report_tab   or f"{cfg.diagnose.report_tab} - {category.title()}"
+    _structure    = cfg.structure_for(category)
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         t = progress.add_task(f"Reading '{_tab}' tab…", total=None)
@@ -100,8 +123,8 @@ def diagnose(
         progress.update(t, description=f"Read {len(sheet_rows)} rows from '{_tab}'")
         progress.stop_task(t)
 
-        t = progress.add_task("Scanning Drive folder…", total=None)
-        report = run(folder_id, sheet_rows, _sku_col, _supplier_col, cfg.paths, _structure)
+        t = progress.add_task(f"Scanning {category} drive…", total=None)
+        report = run(category_folder_id, sheet_rows, _sku_col, _supplier_col, cfg.paths, _structure)
         progress.update(t, description=f"Scanned {len(report.rows)} rows")
         progress.stop_task(t)
 
@@ -141,14 +164,14 @@ def rename_lifestyle_photos(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive root products folder ID (copy destination).",
+        help="Google Drive parent folder ID (the products subfolder is resolved automatically).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID.",
     ),
     tab: Optional[str] = typer.Option(
-        None, help="Sheet tab with the SKU list. Defaults to csv.tab_name in config.",
+        None, help="Sheet tab with the SKU list. Defaults to 'products'.",
     ),
     sku_col: Optional[str] = typer.Option(
         None, help="SKU column header. Defaults to csv.sku_column in config.",
@@ -157,7 +180,7 @@ def rename_lifestyle_photos(
         None, help="Parent product column header. Defaults to csv.parent_product_column in config.",
     ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Tab to write the report into. Defaults to lifestyle.report_tab in config.",
+        None, help="Tab to write the report into. Defaults to '<lifestyle.report_tab> - Products'.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -166,18 +189,21 @@ def rename_lifestyle_photos(
 ) -> None:
     """
     Map lifestyle photo folders (named by parent product) to SKUs and write a
-    rename report. Pass --execute to actually rename the folders in Drive.
+    rename report. Products-only — operates on the products subfolder under
+    GOOGLE_DRIVE_ROOT_FOLDER_ID. Pass --execute to actually rename the folders.
     """
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows, write_report
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.rename_lifestyle import build_report, execute_copy, to_sheet_rows
 
     cfg = PipelineConfig.load(config_path)
+    products_folder_id = drive.resolve_category_folder(root_folder_id, "products")
 
-    _tab               = tab               or cfg.csv.tab_name
+    _tab               = tab               or "products"
     _sku_col           = sku_col           or cfg.csv.sku_column
     _parent_product_col = parent_product_col or cfg.csv.parent_product_column
-    _report_tab        = report_tab        or cfg.lifestyle.report_tab
+    _report_tab        = report_tab        or f"{cfg.lifestyle.report_tab} - Products"
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         t = progress.add_task(f"Reading '{_tab}' tab…", total=None)
@@ -210,8 +236,8 @@ def rename_lifestyle_photos(
             current_entry: str | None = None
             for p in execute_copy(
                 entries,
-                root_folder_id,
-                cfg.drive.structure,
+                products_folder_id,
+                cfg.structure_for("products"),
                 cfg.paths.lifestyle_photos,
             ):
                 if p.file_total == 0:
@@ -278,14 +304,14 @@ def copy_models_into_products(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive root products folder ID (copy destination).",
+        help="Google Drive parent folder ID (the products subfolder is resolved automatically).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID (used only to write the report).",
     ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Tab to write the report into. Defaults to models.report_tab in config.",
+        None, help="Tab to write the report into. Defaults to '<models.report_tab> - Products'.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -296,19 +322,21 @@ def copy_models_into_products(
     Scan the shared models folder, compare against the products Drive, and report on each
     SKU's contents (OBJ/SKP/DWG/CAD/PDF/GLTF). On --execute, copies model files into each
     SKU's product folder; orphan SKUs (in models but not in products) are created.
-    PDF files are copied into the /diagram subfolder.
+    PDF files are copied into the /diagram subfolder. Products-only.
     """
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import write_report
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.copy_models import build_report, execute_copy, to_sheet_rows
 
     cfg = PipelineConfig.load(config_path)
-    _report_tab = report_tab or cfg.models.report_tab
+    products_folder_id = drive.resolve_category_folder(root_folder_id, "products")
+    _report_tab = report_tab or f"{cfg.models.report_tab} - Products"
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         t = progress.add_task("Scanning models folder & products drive…", total=None)
         entries, missing_skus = build_report(
-            models_folder_id, root_folder_id, cfg.drive.structure,
+            models_folder_id, products_folder_id, cfg.structure_for("products"),
         )
         progress.update(t, description=f"Found {len(entries)} SKU folders in models")
         progress.stop_task(t)
@@ -334,7 +362,7 @@ def copy_models_into_products(
             overall_task = copy_bar.add_task("Overall", total=total_skus, completed=0)
             file_task = copy_bar.add_task("Preparing…", total=1)
             current_sku: str | None = None
-            for p in execute_copy(entries, root_folder_id, cfg.drive.structure, cfg.paths):
+            for p in execute_copy(entries, products_folder_id, cfg.structure_for("products"), cfg.paths):
                 if p.file_total == 0:
                     skipped += 1
                     copy_bar.advance(overall_task)
@@ -400,17 +428,21 @@ def upload_local_files(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID (upload destination).",
+        help="Google Drive parent folder ID (contains category subfolders).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID.",
     ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
     tab: Optional[str] = typer.Option(
-        None, help="Sheet tab with the SKU list. Defaults to csv.tab_name in config.",
+        None, help="Sheet tab with the SKU list. Defaults to the category name.",
     ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Tab to write the report into. Defaults to 'Upload - <type>'.",
+        None, help="Tab to write the report into. Defaults to 'Upload - <type> - <Category>'.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -421,8 +453,9 @@ def upload_local_files(
     Generic local-file uploader. Dry run scans the input directory, infers a destination
     SKU per file (filename → supplier ref → product name → PDF content → fuzzy), and
     writes a report to a sheet tab. Edit that tab as needed, then re-run with --execute
-    to upload each file to <products root>/<supplier>/<sku>/<type subdir>/.
+    to upload each file to <category>/<supplier>/<sku>/<type subdir>/.
     """
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows, write_report
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.upload_local_files import (
@@ -433,10 +466,11 @@ def upload_local_files(
     )
 
     cfg = PipelineConfig.load(config_path)
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
     subdir = resolve_type_subdir(asset_type, cfg.paths)
 
-    _tab            = tab        or cfg.csv.tab_name
-    _report_tab     = report_tab or f"Upload - {asset_type}"
+    _tab            = tab        or category
+    _report_tab     = report_tab or f"Upload - {asset_type} - {category.title()}"
     _sku_col        = cfg.csv.sku_column
     _name_col       = cfg.csv.name_column
     _supplier_col   = cfg.csv.supplier_column
@@ -453,7 +487,7 @@ def upload_local_files(
             matches = build_report(
                 input_dir, subdir, sheet_rows,
                 _sku_col, _name_col, _supplier_col, _supplier_ref_col,
-                cfg.drive.structure, supplier,
+                cfg.structure_for(category), supplier,
             )
             progress.update(t, description=f"Found {len(matches)} files")
             progress.stop_task(t)
@@ -496,7 +530,7 @@ def upload_local_files(
     )
     with upload_bar:
         bar_task = upload_bar.add_task("Uploading…", total=actionable, completed=0)
-        for p in execute_copy(report_rows, input_dir, subdir, root_folder_id, cfg.drive.structure):
+        for p in execute_copy(report_rows, input_dir, subdir, category_folder_id, cfg.structure_for(category)):
             label = "skipped" if p.skipped else "uploaded"
             upload_bar.update(
                 bar_task,
@@ -521,14 +555,18 @@ def rename(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID.",
+        help="Google Drive parent folder ID (contains category subfolders).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID (where the diagnose report lives).",
     ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Diagnose report tab. Defaults to diagnose.report_tab in config.",
+        None, help="Diagnose report tab. Defaults to '<diagnose.report_tab> - <Category>'.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -542,12 +580,14 @@ def rename(
     """
     from rich.table import Table
 
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.rename_skus import build_plan, execute_renames
 
     cfg = PipelineConfig.load(config_path)
-    _report_tab = report_tab or cfg.diagnose.report_tab
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+    _report_tab = report_tab or f"{cfg.diagnose.report_tab} - {category.title()}"
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         t = progress.add_task(f"Reading '{_report_tab}'…", total=None)
@@ -556,7 +596,7 @@ def rename(
         progress.stop_task(t)
 
         t = progress.add_task("Resolving Drive folders…", total=None)
-        plans, warnings = build_plan(report_rows, root_folder_id, cfg.drive.structure)
+        plans, warnings = build_plan(report_rows, category_folder_id, cfg.structure_for(category))
         progress.update(
             t,
             description=f"Resolved {len(plans)} renames ({len(warnings)} warnings)",
@@ -616,14 +656,18 @@ def dedupe(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID.",
+        help="Google Drive parent folder ID (contains category subfolders).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID (where the diagnose report lives).",
     ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Diagnose report tab. Defaults to diagnose.report_tab in config.",
+        None, help="Diagnose report tab. Defaults to '<diagnose.report_tab> - <Category>'.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -639,12 +683,14 @@ def dedupe(
     """
     from rich.table import Table
 
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.dedupe import build_plan, execute as run_dedupe
 
     cfg = PipelineConfig.load(config_path)
-    _report_tab = report_tab or cfg.diagnose.report_tab
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+    _report_tab = report_tab or f"{cfg.diagnose.report_tab} - {category.title()}"
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         t = progress.add_task(f"Reading '{_report_tab}'…", total=None)
@@ -653,7 +699,7 @@ def dedupe(
         progress.stop_task(t)
 
         t = progress.add_task("Resolving Drive folders…", total=None)
-        plans, warnings = build_plan(report_rows, root_folder_id, cfg.drive.structure)
+        plans, warnings = build_plan(report_rows, category_folder_id, cfg.structure_for(category))
         progress.update(
             t,
             description=f"Resolved {len(plans)} actions ({len(warnings)} warnings)",
@@ -728,6 +774,128 @@ def dedupe(
     )
 
 
+@app.command("regroup")
+def regroup(
+    config_path: Path = typer.Option(
+        Path("pipeline.config.toml"),
+        envvar="PIPELINE_CONFIG_PATH",
+        help="Path to pipeline.config.toml.",
+    ),
+    root_folder_id: str = typer.Option(
+        ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
+        help="Google Drive parent folder ID (contains category subfolders).",
+    ),
+    category: str = typer.Option(
+        ..., "--category",
+        help="Subfolder under the parent root to regroup (materials, upholstery, …).",
+    ),
+    subdir: str = typer.Option(
+        "", "--subdir",
+        help="Optional subdir to nest files into: <sku>/<subdir>/1.<ext>. Default: no subdir.",
+    ),
+    execute: bool = typer.Option(
+        False, "--execute",
+        help="Apply the moves in Drive. Omit for a dry run.",
+    ),
+) -> None:
+    """
+    Regroup a flat-file category into per-SKU folders.
+
+    Converts <category>/<sku>.<ext> → <category>/<sku>/1.<ext>. Use this to
+    migrate categories like materials and upholstery from a flat layout into
+    the SKU-folder convention so the rest of the pipeline (diagnose, organize,
+    optimize, etc.) can operate on them uniformly.
+
+    Layout (flat vs per-supplier) is auto-detected. Idempotent: SKU folders
+    that already contain a file are skipped, and re-running after a successful
+    migration is a no-op.
+    """
+    from rich.table import Table
+
+    from asset_sdk.adapters import drive
+    from asset_sdk.stages.regroup import build_plan, execute as run_regroup, summarise
+
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        t = progress.add_task(f"Scanning {category} drive…", total=None)
+        plans = build_plan(category_folder_id, subdir)
+        progress.update(t, description=f"Found {len(plans)} files to consider")
+        progress.stop_task(t)
+
+    counts = summarise(plans)
+
+    if not plans:
+        console.print(f"[yellow]No flat files found under {category}/.[/yellow]")
+        return
+
+    PREVIEW = 30
+    table = Table(title=f"Regroup plan: {category} ({counts['actionable']} moves, {counts['skipped']} skipped)")
+    table.add_column("Supplier", style="cyan")
+    table.add_column("File")
+    table.add_column("→")
+    nest = f"/{subdir}" if subdir else ""
+    table.add_column(f"Target (<sku>{nest}/<name>)")
+    table.add_column("Note", style="yellow")
+    for p in plans[:PREVIEW]:
+        note = p.skip_reason or ""
+        target = f"{p.sku}{nest}/{p.target_name}" if not p.skip_reason else "—"
+        table.add_row(p.supplier or "(flat)", p.file_name, "→", target, note)
+    if len(plans) > PREVIEW:
+        table.caption = f"… and {len(plans) - PREVIEW} more"
+    console.print(table)
+
+    if not execute:
+        console.print(
+            f"\n[bold]Dry run complete[/bold] — pass --execute to apply "
+            f"{counts['actionable']} moves ({counts['skipped']} skipped)."
+        )
+        return
+
+    if counts["actionable"] == 0:
+        console.print("[yellow]Nothing actionable — done.[/yellow]")
+        return
+
+    bar = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=30),
+        MofNCompleteColumn(),
+        console=console,
+    )
+    moved = errored = skipped = 0
+    with bar:
+        bar_task = bar.add_task("Regrouping…", total=len(plans), completed=0)
+        for prog in run_regroup(plans, subdir):
+            p = prog.plan
+            if prog.error:
+                errored += 1
+                bar.update(
+                    bar_task,
+                    description=f"  [red]err[/red] {p.file_name}: {prog.error}",
+                    advance=1,
+                )
+            elif prog.done:
+                moved += 1
+                bar.update(
+                    bar_task,
+                    description=f"  [green]ok[/green] {p.file_name} → {p.sku}{nest}/{p.target_name}",
+                    advance=1,
+                )
+            else:
+                skipped += 1
+                bar.update(
+                    bar_task,
+                    description=f"  [dim]skip[/dim] {p.file_name}: {p.skip_reason}",
+                    advance=1,
+                )
+
+    console.print(
+        f"\n[bold]Regroup complete[/bold]  "
+        f"({moved} moved, {skipped} skipped, {errored} errored)"
+    )
+
+
 def _optimize_models(
     cfg,
     sku_filter,
@@ -735,7 +903,8 @@ def _optimize_models(
     output_subdir,
     report_tab,
     sheet_id,
-    root_folder_id,
+    category_folder_id,
+    category,
     execute,
 ):
     """Dispatched from `optimize --type model`."""
@@ -751,12 +920,12 @@ def _optimize_models(
 
     src_subdir = "models/obj"
     dest_subdir = output_subdir or cfg.optimize.model_dest_subdir
-    _report_tab = report_tab or f"{cfg.optimize.report_tab} - model"
+    _report_tab = report_tab or f"{cfg.optimize.report_tab} - model - {category.title()}"
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
-        t = progress.add_task("Scanning products drive for models…", total=None)
+        t = progress.add_task(f"Scanning {category} drive for models…", total=None)
         targets = find_model_targets(
-            root_folder_id, cfg.drive.structure, src_subdir, dest_subdir,
+            category_folder_id, cfg.structure_for(category), src_subdir, dest_subdir,
             sku_filter, supplier_filter,
         )
         progress.update(t, description=f"Found {len(targets)} SKUs with OBJ files")
@@ -900,15 +1069,19 @@ def optimize(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID.",
+        help="Google Drive parent folder ID (contains category subfolders).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID (where the dry-run report is written).",
     ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
     report_tab: Optional[str] = typer.Option(
         None,
-        help="Report tab for the dry-run analysis. Defaults to optimize.report_tab in config.",
+        help="Report tab for the dry-run analysis. Defaults to '<optimize.report_tab> - <Category>'.",
     ),
     target_size: Optional[int] = typer.Option(None, help="Override target_size from config."),
     quality: Optional[int] = typer.Option(None, help="Override JPG quality (0-95)."),
@@ -925,24 +1098,26 @@ def optimize(
     """
     from rich.table import Table
 
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import write_report
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.upload_local_files import resolve_type_subdir
 
     cfg = PipelineConfig.load(config_path)
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
     opt_cfg = cfg.optimize
 
     # Dispatch model pipeline early — it has different download/optimize semantics.
     if asset_type.lower() in ("model", "models", "obj"):
         _optimize_models(
             cfg, sku_filter, supplier_filter, output_subdir, report_tab,
-            sheet_id, root_folder_id, execute,
+            sheet_id, category_folder_id, category, execute,
         )
         return
 
     src_subdir = resolve_type_subdir(asset_type, cfg.paths)
     dest_subdir = output_subdir or f"{src_subdir}{cfg.optimize.output_subdir_suffix}"
-    _report_tab = report_tab or cfg.optimize.report_tab
+    _report_tab = report_tab or f"{cfg.optimize.report_tab} - {category.title()}"
 
     if target_size is not None:
         opt_cfg.target_size = target_size
@@ -957,9 +1132,9 @@ def optimize(
     )
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
-        t = progress.add_task("Scanning products drive…", total=None)
+        t = progress.add_task(f"Scanning {category} drive…", total=None)
         targets = find_targets(
-            root_folder_id, cfg.drive.structure, src_subdir, dest_subdir,
+            category_folder_id, cfg.structure_for(category), src_subdir, dest_subdir,
             sku_filter, supplier_filter,
         )
         total_files = sum(len(t.files) for t in targets)
@@ -1096,22 +1271,26 @@ def scaffold(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID.",
+        help="Google Drive parent folder ID (contains category subfolders).",
     ),
     sheet_id: str = typer.Option(
         ..., envvar="GOOGLE_SHEETS_MASTER_ID",
         help="Google Sheets file ID.",
     ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
     moved_folder_id: Optional[str] = typer.Option(
         None, envvar="GOOGLE_DRIVE_MOVED_FOLDER_ID",
         help="Drive folder ID to quarantine non-canonical dirs into (with --clean --move). "
-             "If empty, scaffold creates/finds scaffold.moved_folder_name under the products root.",
+             "If empty, scaffold creates/finds scaffold.moved_folder_name under the category root.",
     ),
     tab: Optional[str] = typer.Option(
-        None, help="Sheet tab with the SKU list. Defaults to csv.tab_name in config.",
+        None, help="Sheet tab with the SKU list. Defaults to the category name.",
     ),
     report_tab: Optional[str] = typer.Option(
-        None, help="Tab to write the scaffold report into. Defaults to scaffold.report_tab.",
+        None, help="Tab to write the scaffold report into. Defaults to '<scaffold.report_tab> - <Category>'.",
     ),
     fix: bool = typer.Option(
         False, "--fix",
@@ -1131,7 +1310,7 @@ def scaffold(
     ),
 ) -> None:
     """
-    Scaffold the products drive: create missing SKU folders from the sheet, ensure each
+    Scaffold the category drive: create missing SKU folders from the sheet, ensure each
     SKU has the canonical subdir structure from paths.input. Optional --fix moves loose
     files into the right subdir and corrects typo'd folder names. Optional --clean
     deletes junk files and non-canonical dirs (use --move to quarantine them under
@@ -1139,6 +1318,7 @@ def scaffold(
     """
     from rich.table import Table
 
+    from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows, write_report
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.scaffold import (
@@ -1149,10 +1329,11 @@ def scaffold(
     )
 
     cfg = PipelineConfig.load(config_path)
-    _tab        = tab        or cfg.csv.tab_name
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+    _tab        = tab        or category
     _sku_col    = cfg.csv.sku_column
     _supplier_col = cfg.csv.supplier_column
-    _report_tab = report_tab or cfg.scaffold.report_tab
+    _report_tab = report_tab or f"{cfg.scaffold.report_tab} - {category.title()}"
 
     if move_unknown and not clean:
         console.print("[yellow]--move only applies with --clean. Ignoring.[/yellow]")
@@ -1164,10 +1345,10 @@ def scaffold(
         progress.update(t, description=f"Read {len(sheet_rows)} rows from '{_tab}'")
         progress.stop_task(t)
 
-        t = progress.add_task("Scanning products drive…", total=None)
+        t = progress.add_task(f"Scanning {category} drive…", total=None)
         actions = build_plan(
-            root_folder_id, sheet_rows, _sku_col, _supplier_col,
-            cfg.paths, cfg.drive.structure,
+            category_folder_id, sheet_rows, _sku_col, _supplier_col,
+            cfg.paths, cfg.structure_for(category),
             fix=fix, clean=clean, move_unknown=move_unknown,
             typo_cutoff=cfg.scaffold.typo_cutoff,
         )
@@ -1229,7 +1410,7 @@ def scaffold(
     with bar:
         bar_task = bar.add_task("Applying…", total=len(actionable_actions), completed=0)
         for prog in run_scaffold(
-            actions, root_folder_id, cfg.drive.structure,
+            actions, category_folder_id, cfg.structure_for(category),
             cfg.scaffold.moved_folder_name,
             moved_folder_id or "",
         ):
@@ -1275,7 +1456,11 @@ def permissions(
     ),
     root_folder_id: str = typer.Option(
         ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID.",
+        help="Google Drive parent folder ID (contains category subfolders).",
+    ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
     ),
     detailed: bool = typer.Option(
         False, "--detailed",
@@ -1287,19 +1472,21 @@ def permissions(
     ),
 ) -> None:
     """
-    Set Drive file permissions on every file under <sku>/<type-subdir>/ recursively.
+    Set Drive file permissions on every file under <category>/<sku>/<type-subdir>/ recursively.
 
     Examples:
       uv run asset permissions --type photo --access public --execute
       uv run asset permissions --type models_obj --access private --execute
       uv run asset permissions --type lifestyle --access public --supplier mansa --execute
       uv run asset permissions --type photo --access public --detailed
+      uv run asset permissions --type photo --access public --category materials --execute
 
     public  = grants 'anyone with the link can view' to every file
     private = removes any 'anyone' permission, leaving only explicitly-shared users
     """
     from rich.table import Table
 
+    from asset_sdk.adapters import drive
     from asset_sdk.config import PipelineConfig
     from asset_sdk.stages.permissions import (
         execute as run_perms,
@@ -1312,12 +1499,13 @@ def permissions(
         raise typer.BadParameter("--access must be 'public' or 'private'")
 
     cfg = PipelineConfig.load(config_path)
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
     src_subdir = resolve_type_subdir(asset_type, cfg.paths)
 
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
-        t = progress.add_task(f"Scanning <sku>/{src_subdir}/ files…", total=None)
+        t = progress.add_task(f"Scanning {category}/<sku>/{src_subdir}/ files…", total=None)
         targets = find_targets(
-            root_folder_id, cfg.drive.structure, src_subdir,
+            category_folder_id, cfg.structure_for(category), src_subdir,
             sku_filter, supplier_filter,
         )
         progress.update(t, description=f"Found {len(targets)} files across SKUs")
@@ -1440,7 +1628,11 @@ def organize(
     ),
     root_folder_id: Optional[str] = typer.Option(
         None, envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
-        help="Google Drive products root folder ID (only used with --rename).",
+        help="Google Drive parent folder ID (contains category subfolders).",
+    ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
     ),
 ) -> None:
     """
@@ -1454,12 +1646,12 @@ def organize(
     the files in Drive sequentially as 1.<ext>, 2.<ext>, …
     """
     if rename:
-        _organize_rename(config_path, root_folder_id, execute)
+        _organize_rename(config_path, root_folder_id, category, execute)
         return
-    _organize_serve(api_port, web_port, no_browser)
+    _organize_serve(api_port, web_port, no_browser, category)
 
 
-def _organize_serve(api_port: int, web_port: int, no_browser: bool) -> None:
+def _organize_serve(api_port: int, web_port: int, no_browser: bool, category: str) -> None:
     """Start the FastAPI backend + Next.js dev server, open the browser."""
     import shutil
     import signal
@@ -1520,13 +1712,16 @@ def _organize_serve(api_port: int, web_port: int, no_browser: bool) -> None:
         return False
 
     try:
-        console.print(f"[bold]Starting API on :{api_port}…[/bold]")
+        console.print(f"[bold]Starting API on :{api_port} (category={category})…[/bold]")
+        api_env = os.environ.copy()
+        api_env["GOOGLE_DRIVE_CATEGORY"] = category
         api_proc = subprocess.Popen(
             [
                 "uv", "run", "uvicorn", "asset_api.main:app",
                 "--host", "127.0.0.1", "--port", str(api_port),
             ],
             cwd=str(repo_root),
+            env=api_env,
         )
 
         if not _wait_for(f"http://127.0.0.1:{api_port}/api/health", 30.0, "API"):
@@ -1567,7 +1762,12 @@ def _organize_serve(api_port: int, web_port: int, no_browser: bool) -> None:
         _cleanup()
 
 
-def _organize_rename(config_path: Path, root_folder_id: Optional[str], execute: bool) -> None:
+def _organize_rename(
+    config_path: Path,
+    root_folder_id: Optional[str],
+    category: str,
+    execute: bool,
+) -> None:
     """Read saved orders and rename files in Drive sequentially."""
     import asyncio
     from pathlib import PurePosixPath as _PP
@@ -1586,9 +1786,11 @@ def _organize_rename(config_path: Path, root_folder_id: Optional[str], execute: 
         console.print("[red]GOOGLE_DRIVE_ROOT_FOLDER_ID is not set.[/red]")
         raise typer.Exit(1)
 
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+
     cfg = PipelineConfig.load(config_path)
     photos_subdir = cfg.paths.product_photos
-    structure = cfg.drive.structure
+    structure = cfg.structure_for(category)
 
     # Pull all saved orders from the DB.
     async def _load_orders() -> list[PhotoOrder]:
@@ -1604,10 +1806,10 @@ def _organize_rename(config_path: Path, root_folder_id: Optional[str], execute: 
 
     # Index SKU folders by name.
     if structure == "flat":
-        sku_index = {name: ("", fid) for name, fid in drive.list_folders(root_folder_id).items()}
+        sku_index = {name: ("", fid) for name, fid in drive.list_folders(category_folder_id).items()}
     else:
         sku_index = {}
-        for sup_name, sup_id in drive.list_folders(root_folder_id).items():
+        for sup_name, sup_id in drive.list_folders(category_folder_id).items():
             for name, fid in drive.list_folders(sup_id).items():
                 sku_index[name] = (sup_name, fid)
 

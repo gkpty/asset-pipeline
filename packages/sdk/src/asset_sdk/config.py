@@ -3,6 +3,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -19,6 +20,12 @@ class CsvConfig:
 class DriveConfig:
     # "supplier" → root/supplier/sku  |  "flat" → root/sku
     structure: str = "supplier"
+
+
+@dataclass
+class CategoryConfig:
+    # Per-category override. Currently just `structure`; future: paths/diagnostics overrides.
+    structure: Optional[str] = None
 
 
 @dataclass
@@ -111,14 +118,22 @@ class InputPaths:
 
 @dataclass
 class PipelineConfig:
-    csv:       CsvConfig       = field(default_factory=CsvConfig)
-    drive:     DriveConfig     = field(default_factory=DriveConfig)
-    diagnose:  DiagnoseConfig  = field(default_factory=DiagnoseConfig)
-    lifestyle: LifestyleConfig = field(default_factory=LifestyleConfig)
-    models:    ModelsConfig    = field(default_factory=ModelsConfig)
-    scaffold:  ScaffoldConfig  = field(default_factory=ScaffoldConfig)
-    optimize:  OptimizeConfig  = field(default_factory=OptimizeConfig)
-    paths:     InputPaths      = field(default_factory=InputPaths)
+    csv:        CsvConfig                  = field(default_factory=CsvConfig)
+    drive:      DriveConfig                = field(default_factory=DriveConfig)
+    diagnose:   DiagnoseConfig             = field(default_factory=DiagnoseConfig)
+    lifestyle:  LifestyleConfig            = field(default_factory=LifestyleConfig)
+    models:     ModelsConfig               = field(default_factory=ModelsConfig)
+    scaffold:   ScaffoldConfig             = field(default_factory=ScaffoldConfig)
+    optimize:   OptimizeConfig             = field(default_factory=OptimizeConfig)
+    paths:      InputPaths                 = field(default_factory=InputPaths)
+    categories: dict[str, CategoryConfig]  = field(default_factory=dict)
+
+    def structure_for(self, category: str) -> str:
+        """Return the Drive structure override for `category`, falling back to drive.structure."""
+        cat = self.categories.get(category.strip().lower())
+        if cat and cat.structure:
+            return cat.structure
+        return self.drive.structure
 
     @classmethod
     def load(cls, path: Path) -> "PipelineConfig":
@@ -129,6 +144,10 @@ class PipelineConfig:
             known = {f.name for f in fields(dc)}
             return dc(**{k: v for k, v in section.items() if k in known})
 
+        categories: dict[str, CategoryConfig] = {}
+        for name, section in (raw.get("categories") or {}).items():
+            categories[name.strip().lower()] = _build(CategoryConfig, section)
+
         return cls(
             csv=_build(CsvConfig, raw.get("csv", {})),
             drive=_build(DriveConfig, raw.get("drive", {})),
@@ -138,4 +157,5 @@ class PipelineConfig:
             scaffold=_build(ScaffoldConfig, raw.get("scaffold", {})),
             optimize=_build(OptimizeConfig, raw.get("optimize", {})),
             paths=_build(InputPaths, raw.get("paths", {}).get("input", {})),
+            categories=categories,
         )

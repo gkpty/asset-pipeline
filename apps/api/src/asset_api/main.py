@@ -42,11 +42,29 @@ def _load_cfg() -> PipelineConfig:
     return state.cfg
 
 
+def _category() -> str:
+    """Category subfolder under the parent root. Defaults to 'products'."""
+    return os.environ.get("GOOGLE_DRIVE_CATEGORY", "products").strip() or "products"
+
+
 def _root_folder_id() -> str:
     rf = os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID")
     if not rf:
         raise HTTPException(500, "GOOGLE_DRIVE_ROOT_FOLDER_ID is not set")
     return rf
+
+
+def _category_folder_id() -> str:
+    """Resolve <parent>/<category> Drive folder ID. Cached on `state` after first lookup."""
+    cached = getattr(state, "category_folder_id", None)
+    if cached:
+        return cached
+    try:
+        fid = drive.resolve_category_folder(_root_folder_id(), _category())
+    except Exception as exc:
+        raise HTTPException(500, f"Could not resolve category folder: {exc}")
+    state.category_folder_id = fid
+    return fid
 
 
 def _resolve_subfolder(parent_id: str, rel_path: str) -> str | None:
@@ -87,22 +105,23 @@ def _scan_one_sku(sku: str, sku_id: str, supplier: str, photos_subdir: str) -> d
 
 
 def _scan_skus() -> list[dict]:
-    """Walk the products drive in parallel, capturing every SKU + its photos folder."""
+    """Walk the category drive in parallel, capturing every SKU + its photos folder."""
     from concurrent.futures import ThreadPoolExecutor
     cfg = _load_cfg()
     photos_subdir = cfg.paths.product_photos
+    category_id = _category_folder_id()
 
     # Phase 1 (sequential, fast): enumerate SKU folders.
     sku_tuples: list[tuple[str, str, str]] = []  # (sku, supplier, sku_folder_id)
-    if cfg.drive.structure == "flat":
-        for sku, sid in drive.list_folders(_root_folder_id()).items():
+    if cfg.structure_for(_category()) == "flat":
+        for sku, sid in drive.list_folders(category_id).items():
             sku_tuples.append((sku, "", sid))
     else:
-        for sup_name, sup_id in drive.list_folders(_root_folder_id()).items():
+        for sup_name, sup_id in drive.list_folders(category_id).items():
             for sku, sid in drive.list_folders(sup_id).items():
                 sku_tuples.append((sku, sup_name, sid))
 
-    print(f"[skus] Found {len(sku_tuples)} SKU folders, scanning photos in parallel…", flush=True)
+    print(f"[skus] Found {len(sku_tuples)} SKU folders in {_category()}, scanning photos in parallel…", flush=True)
 
     # Phase 2 (parallel, slow): per-SKU resolve photos folder + count files.
     out: list[dict] = []
@@ -188,7 +207,7 @@ async def _apply_saved_orders(items: list[dict]) -> None:
 
 
 async def _populate_cache() -> None:
-    print("[skus] Scanning products drive…", flush=True)
+    print(f"[skus] Scanning {_category()} drive…", flush=True)
     items = _scan_skus()
     await _apply_saved_orders(items)
     state.skus_cache = items

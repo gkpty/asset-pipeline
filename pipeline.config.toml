@@ -20,9 +20,20 @@ parent_product_column  = "parent product"
 supplier_ref_column = "supplier ref"
 
 [drive]
-# "supplier" → root / supplier / sku  (default)
+# Default structure for a category, used when [categories.<name>] doesn't override.
+# "supplier" → root / supplier / sku
 # "flat"     → root / sku
 structure = "supplier"
+
+# Per-category overrides. Add a section per category whose layout differs from
+# the default above. Example:
+#   [categories.materials]
+#   structure = "flat"
+[categories.materials]
+structure = "flat"
+
+[categories.upholstery]
+structure = "flat"
 
 [diagnose]
 report_tab = "Diagnose Report"

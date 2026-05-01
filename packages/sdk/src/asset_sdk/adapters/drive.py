@@ -95,6 +95,26 @@ def list_folders(parent_id: str) -> dict[str, str]:
     return result
 
 
+def resolve_category_folder(parent_folder_id: str, category: str) -> str:
+    """Return the ID of the child folder of `parent_folder_id` whose name matches
+    `category` (case-insensitive). Raises a clear error if no match is found.
+
+    Used to support a parent/category/supplier/sku layout where the env var
+    GOOGLE_DRIVE_ROOT_FOLDER_ID points at the parent and CLI commands take
+    `--category products|materials|...`.
+    """
+    children = list_folders(parent_folder_id)
+    target = category.strip().lower()
+    for name, fid in children.items():
+        if name.strip().lower() == target:
+            return fid
+    available = ", ".join(sorted(children.keys())) or "(none)"
+    raise RuntimeError(
+        f"Category folder {category!r} not found under parent {parent_folder_id}. "
+        f"Available children: {available}"
+    )
+
+
 def count_files(folder_id: str) -> int:
     """Count non-folder, non-trashed files directly inside folder_id."""
     svc = _service()
