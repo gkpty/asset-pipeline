@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import tempfile
 from dataclasses import dataclass
@@ -49,42 +51,92 @@ def _product_bbox(arr: np.ndarray, threshold: int) -> tuple[int, int, int, int] 
     return int(cmin), int(rmin), int(cmax) + 1, int(rmax) + 1
 
 
-def optimize_image(img: Image.Image, cfg: OptimizeConfig) -> Image.Image:
-    """Standardisation pipeline:
+def optimize_image(
+    img: Image.Image,
+    cfg: OptimizeConfig,
+    *,
+    clean_bg: bool = True,
+    pad_to_square: bool = True,
+    resize: bool = True,
+) -> Image.Image:
+    """Standardisation pipeline. Each step is conditional so the per-row
+    Action flags from the report (Remove BG, Pad to Square, Resize, …)
+    can opt out of any individual transform.
 
-    1. Convert to RGB, flattening alpha onto white.
-    2. Clean near-white background to pure white.
-    3. Detect product bounding box; crop to it.
-    4. Center on a square white canvas with target_padding_pct on the longest side.
-    5. Resize the canvas to target_size × target_size (LANCZOS).
+    Steps (each gated by its own flag):
+
+      1. Convert to RGB, flattening alpha onto white. (always)
+      2. Clean near-white background to pure white. (clean_bg)
+      3. Detect product bounding box and recenter on a square white canvas
+         with target_padding_pct margin. Wide products get top/bottom padding;
+         tall products get side padding. (pad_to_square)
+      4. Resize the canvas to target_size × target_size. (resize)
+
+    `compress` (controlling the JPEG quality cap) is applied later in
+    `save_jpeg`, which always honors max_file_mb. Pass `compress=False` to
+    `save_jpeg` directly when a row sets Compress=FALSE.
     """
     img = _to_rgb_white_bg(img)
-    arr = np.array(img)
-    arr = _clean_near_white(arr, cfg.white_threshold)
 
-    bbox = _product_bbox(arr, cfg.white_threshold)
-    cleaned = Image.fromarray(arr)
+    if clean_bg:
+        arr = np.array(img)
+        arr = _clean_near_white(arr, cfg.white_threshold)
+        bbox = _product_bbox(arr, cfg.white_threshold)
+        cleaned = Image.fromarray(arr)
+    else:
+        # Skip background cleaning (close-up shots). bbox detection still uses
+        # near-white as the criterion, but we don't rewrite any pixels.
+        arr = np.array(img)
+        bbox = _product_bbox(arr, cfg.white_threshold)
+        cleaned = img
 
-    if bbox is None:
-        # All-white input — just emit a white square at target size.
-        return Image.new("RGB", (cfg.target_size, cfg.target_size), (255, 255, 255))
+    if pad_to_square:
+        if bbox is None:
+            # All-near-white input — just emit a white square at target size (or original size).
+            target_dim = cfg.target_size if resize else max(cleaned.size)
+            return Image.new("RGB", (target_dim, target_dim), (255, 255, 255))
 
-    product = cleaned.crop(bbox)
-    pw, ph = product.size
+        product = cleaned.crop(bbox)
+        pw, ph = product.size
 
-    # Canvas size such that longest side = (1 - 2*padding%) of canvas.
-    pad_frac = cfg.target_padding_pct / 100.0
-    inner_frac = max(1.0 - 2 * pad_frac, 0.05)
-    canvas_size = max(int(max(pw, ph) / inner_frac), pw, ph)
+        # Canvas size such that longest side = (1 - 2*padding%) of canvas.
+        pad_frac = cfg.target_padding_pct / 100.0
+        inner_frac = max(1.0 - 2 * pad_frac, 0.05)
+        canvas_size = max(int(max(pw, ph) / inner_frac), pw, ph)
 
-    canvas = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
-    canvas.paste(product, ((canvas_size - pw) // 2, (canvas_size - ph) // 2))
+        canvas = Image.new("RGB", (canvas_size, canvas_size), (255, 255, 255))
+        canvas.paste(product, ((canvas_size - pw) // 2, (canvas_size - ph) // 2))
+        result = canvas
+    else:
+        # Don't pad to square — keep original framing.
+        result = cleaned
 
-    return canvas.resize((cfg.target_size, cfg.target_size), Image.LANCZOS)
+    if resize:
+        # If pad_to_square produced a canvas, this resizes it to the target square.
+        # If not (close-up keeping aspect), this scales the longest edge to target_size.
+        rw, rh = result.size
+        if rw == rh:
+            return result.resize((cfg.target_size, cfg.target_size), Image.LANCZOS)
+        scale = cfg.target_size / max(rw, rh)
+        return result.resize((int(rw * scale), int(rh * scale)), Image.LANCZOS)
+
+    return result
 
 
-def save_jpeg(img: Image.Image, path: str, cfg: OptimizeConfig) -> int:
-    """Save as JPEG, decreasing quality until the file fits under max_file_mb."""
+def save_jpeg(
+    img: Image.Image,
+    path: str,
+    cfg: OptimizeConfig,
+    *,
+    compress: bool = True,
+) -> int:
+    """Save as JPEG. With `compress=True` (default), decreasing quality until
+    the file fits under cfg.max_file_mb. With `compress=False`, save once at
+    cfg.jpg_quality without the size cap (used when the row's Compress flag
+    is FALSE)."""
+    if not compress:
+        img.save(path, "JPEG", quality=cfg.jpg_quality, optimize=True)
+        return os.path.getsize(path)
     cap_bytes = int(cfg.max_file_mb * 1024 * 1024)
     for q in (cfg.jpg_quality, 80, 75, 70, 65, 60, 55, 50):
         img.save(path, "JPEG", quality=q, optimize=True)
@@ -182,6 +234,9 @@ class PhotoAnalysis:
     current_width: int
     current_height: int
     current_size_bytes: int
+    target_size_bytes: int        # actual JPEG-encoded size after optimize_image (0 for duplicates)
+    content_hash: str             # md5 of the source bytes
+    is_duplicate_of: str          # filename of the first occurrence within the same SKU; "" if unique
     pure_white_pct: float
     near_white_pct: float
     has_background: bool          # True when near_white < 80%
@@ -230,6 +285,31 @@ def _analyze_image(
     return pure_white, near_white, has_bg, padding, _aspect_label(w, h)
 
 
+def _md5_file(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _estimate_target_size(img: Image.Image, cfg: OptimizeConfig) -> int:
+    """Run the optimize pipeline to an in-memory JPEG buffer and return its size.
+
+    Honors the same defaults the report's auto-set Action flags will use:
+    clean background, pad to square, resize, compress (cap to max_file_mb).
+    """
+    optimized = optimize_image(img, cfg, clean_bg=True, pad_to_square=True, resize=True)
+    cap_bytes = int(cfg.max_file_mb * 1024 * 1024)
+    for q in (cfg.jpg_quality, 80, 75, 70, 65, 60, 55, 50):
+        buf = io.BytesIO()
+        optimized.save(buf, format="JPEG", quality=q, optimize=True)
+        size = buf.tell()
+        if size <= cap_bytes:
+            return size
+    return size
+
+
 def analyze(
     targets: list[PhotoTarget],
     cfg: OptimizeConfig,
@@ -238,24 +318,42 @@ def analyze(
 
     Yields (target, file_meta, analysis_or_None, error_or_None) per file so the caller
     can drive a progress bar. analysis is None when an error occurs.
+
+    Adds within-SKU duplicate detection (md5 of source bytes) and an accurate
+    target_size estimate (actual JPEG encode of the optimized image to a buffer).
+    Duplicates skip the size estimate since they won't be uploaded.
     """
     with tempfile.TemporaryDirectory() as tmp:
         for t in targets:
+            # SKU-scoped: hash → first filename that had it. Subsequent matches
+            # are flagged as duplicates pointing back to that filename.
+            seen_in_sku: dict[str, str] = {}
             for f in t.files:
                 src_path = os.path.join(tmp, f["name"])
                 try:
                     drive.download_file(f["id"], src_path)
+                    digest = _md5_file(src_path)
+                    duplicate_of = seen_in_sku.get(digest, "")
+                    if not duplicate_of:
+                        seen_in_sku[digest] = f["name"]
+
                     with Image.open(src_path) as img:
                         fmt = (img.format or "UNKNOWN").upper()
                         w, h = img.size
                         size_bytes = os.path.getsize(src_path)
                         pure, near, has_bg, padding, aspect = _analyze_image(img, src_path, cfg)
+                        # Skip the (expensive) JPEG-encode estimate for duplicates.
+                        target_bytes = 0 if duplicate_of else _estimate_target_size(img, cfg)
+
                     analysis = PhotoAnalysis(
                         sku=t.sku, supplier=t.supplier,
                         file_id=f["id"], file_name=f["name"],
                         current_format=fmt,
                         current_width=w, current_height=h,
                         current_size_bytes=size_bytes,
+                        target_size_bytes=target_bytes,
+                        content_hash=digest,
+                        is_duplicate_of=duplicate_of,
                         pure_white_pct=pure, near_white_pct=near,
                         has_background=has_bg,
                         current_padding_pct=padding,
@@ -279,66 +377,85 @@ def to_sheet_rows(
     analyses: list[PhotoAnalysis],
     cfg: OptimizeConfig,
 ) -> tuple[list[str], list[list]]:
+    """Build the editable Optimize Report.
+
+    Headers:
+        SKU | Supplier | File | Preview | Format | Width | Height | Aspect
+        | Current MB | Target MB | Has BG | Duplicate Of
+        | Convert JPG | Remove BG | Pad to Square | Resize | Compress
+        | Notes
+
+    The five rightmost flags are auto-set based on analysis but EDITABLE — set
+    Remove BG=FALSE on a close-up that legitimately has no white background;
+    set Pad to Square=FALSE if you want to preserve a non-square crop; etc.
+
+    Duplicates within the same SKU are flagged via Duplicate Of and skipped on
+    execute (the canonical version gets optimized to the same dest path).
+    """
     headers = [
         "SKU", "Supplier", "File", "Preview",
-        "Format", "Dimensions", "Aspect", "File Size",
-        "Padding", "Background", "Actions",
+        "Format", "Width", "Height", "Aspect",
+        "Current MB", "Target MB",
+        "Has BG", "Duplicate Of",
+        "Convert JPG", "Remove BG", "Pad to Square", "Resize", "Compress",
+        "Notes",
     ]
 
     rows: list[list] = []
     for a in analyses:
-        actions: list[str] = []
-        if a.current_format != "JPEG":
-            actions.append(f"format {a.current_format} → JPG")
-        if a.current_width != cfg.target_size or a.current_height != cfg.target_size:
-            actions.append(
-                f"resize {a.current_width}×{a.current_height} → "
-                f"{cfg.target_size}×{cfg.target_size}"
-            )
-        if (
-            a.current_padding_pct is not None
-            and abs(a.current_padding_pct - cfg.target_padding_pct) > 1.5
-        ):
-            actions.append(
-                f"padding {a.current_padding_pct:.0f}% → {cfg.target_padding_pct:.0f}%"
-            )
-        if a.aspect_label != "1:1":
-            actions.append("square canvas")
-        if a.has_background or a.pure_white_pct < a.near_white_pct - 5:
-            actions.append("clean background to pure white")
-        if a.current_size_bytes > cfg.max_file_mb * 1024 * 1024:
-            actions.append(f"compress (currently {_human_mb(a.current_size_bytes)})")
+        is_dup = bool(a.is_duplicate_of)
 
-        # Mode 1 (default) fits the image to the cell while preserving aspect ratio.
-        # Combined with the row-height bump applied by the CLI after the write, this
-        # gives a roughly 120px-tall thumbnail with whatever width the column has.
+        # Default action flags. Duplicates default everything to FALSE — the
+        # canonical row will produce the optimized output, so this row is
+        # skipped on execute regardless of flag values.
+        if is_dup:
+            convert_jpg = remove_bg = pad_square = resize = compress = "FALSE"
+        else:
+            convert_jpg = "TRUE" if a.current_format != "JPEG" else "FALSE"
+            remove_bg = "TRUE" if a.has_background else "FALSE"
+            # Pad to square unless already 1:1 AND already at target size.
+            already_square = a.aspect_label == "1:1"
+            already_target_dim = a.current_width == cfg.target_size and a.current_height == cfg.target_size
+            pad_square = "FALSE" if already_square and already_target_dim else "TRUE"
+            resize = "TRUE" if not already_target_dim else "FALSE"
+            # Always cap to max_file_mb if currently above it; default TRUE so
+            # any newly-optimized image stays under the cap (cheap when already small).
+            compress = "TRUE"
+
+        notes_parts: list[str] = []
+        if is_dup:
+            notes_parts.append(f"duplicate of {a.is_duplicate_of}")
+        if a.has_background:
+            notes_parts.append(f"{a.near_white_pct:.0f}% near-white")
+        if a.aspect_label != "1:1":
+            notes_parts.append(a.aspect_label)
+        if a.current_size_bytes > cfg.max_file_mb * 1024 * 1024:
+            notes_parts.append(f"oversized ({_human_mb(a.current_size_bytes)})")
+        notes = "; ".join(notes_parts)
+
         preview_url = f"https://drive.google.com/thumbnail?id={a.file_id}&sz=w400"
         preview = f'=IMAGE("{preview_url}")'
 
-        if a.current_padding_pct is None:
-            pad_str = "—"
-        else:
-            pad_str = f"{a.current_padding_pct:.0f}% → {cfg.target_padding_pct:.0f}%"
-
-        if a.has_background:
-            bg_str = f"Has background ({a.near_white_pct:.0f}% near-white)"
-        elif a.pure_white_pct < a.near_white_pct - 5:
-            bg_str = f"Subtle off-white ({a.pure_white_pct:.0f}% pure / {a.near_white_pct:.0f}% near)"
-        else:
-            bg_str = f"Clean ({a.pure_white_pct:.0f}% pure white)"
+        target_mb_str = (
+            "—" if is_dup or a.target_size_bytes == 0
+            else f"{a.target_size_bytes / 1024 / 1024:.2f}"
+        )
 
         rows.append([
             a.sku,
             a.supplier,
             a.file_name,
             preview,
-            f"{a.current_format} → JPG",
-            f"{a.current_width}×{a.current_height} → {cfg.target_size}×{cfg.target_size}",
+            a.current_format,
+            a.current_width,
+            a.current_height,
             a.aspect_label,
-            f"{_human_mb(a.current_size_bytes)} → ≤{cfg.max_file_mb}MB",
-            pad_str,
-            bg_str,
-            "; ".join(actions) if actions else "—",
+            f"{a.current_size_bytes / 1024 / 1024:.2f}",
+            target_mb_str,
+            "TRUE" if a.has_background else "FALSE",
+            a.is_duplicate_of,
+            convert_jpg, remove_bg, pad_square, resize, compress,
+            notes,
         ])
 
     return headers, rows
@@ -359,40 +476,133 @@ class OptimizeProgress(NamedTuple):
     skipped: bool        # True when output already existed
 
 
+def _bool(s: str | None) -> bool:
+    """Parse a TRUE/FALSE/yes/no/1/0 cell from the report."""
+    if not s:
+        return False
+    return str(s).strip().upper() in ("TRUE", "YES", "Y", "1", "T")
+
+
 def execute(
+    report_rows: list[dict[str, str]],
     targets: list[PhotoTarget],
     cfg: OptimizeConfig,
 ) -> Generator[OptimizeProgress, None, None]:
-    """Download → optimize → upload each image. Idempotent: skips files that already
-    exist in the destination folder."""
-    with tempfile.TemporaryDirectory() as tmp:
-        for sku_idx, t in enumerate(targets, 1):
+    """Apply each report row's per-action flags to its photo.
+
+    Read the (possibly edited) report and for each row:
+      - SKIP if the row has Duplicate Of set (the canonical version handles upload).
+      - SKIP if every action flag is FALSE (no work to do).
+      - Otherwise download → run optimize_image with only the TRUE flags →
+        save_jpeg honoring Compress → upload to <sku>/<photos-optimized>/.
+
+    `targets` is still needed to resolve <sku>/<photos>/ source folder + the
+    destination folder ID. We index it by (sku, file_name).
+    """
+    # Build (sku, file_name) → (target, file_meta) lookup so each report row
+    # can find its source on Drive without re-walking the category.
+    file_index: dict[tuple[str, str], tuple[PhotoTarget, dict]] = {}
+    for t in targets:
+        for f in t.files:
+            file_index[(t.sku, f["name"])] = (t, f)
+
+    # Pre-resolve dest folder per SKU; cache existing-output names.
+    dest_cache: dict[str, tuple[str, set[str]]] = {}
+    def _dest_for(t: PhotoTarget) -> tuple[str, set[str]]:
+        if t.sku not in dest_cache:
             dest_id = drive.find_or_create_folder(t.dest_subdir, t.sku_folder_id)
             existing = {f["name"] for f in drive.list_files(dest_id)}
+            dest_cache[t.sku] = (dest_id, existing)
+        return dest_cache[t.sku]
 
-            for file_idx, f in enumerate(t.files, 1):
-                out_name = Path(f["name"]).stem + ".jpg"
-                if out_name in existing:
+    # We need a per-(sku) running totals for the progress NamedTuple. Group rows by SKU.
+    rows_by_sku: dict[str, list[dict[str, str]]] = {}
+    sku_order: list[str] = []
+    for r in report_rows:
+        sku = (r.get("SKU") or "").strip()
+        if not sku:
+            continue
+        if sku not in rows_by_sku:
+            rows_by_sku[sku] = []
+            sku_order.append(sku)
+        rows_by_sku[sku].append(r)
+
+    sku_total = len(sku_order)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for sku_idx, sku in enumerate(sku_order, 1):
+            sku_rows = rows_by_sku[sku]
+            file_total = len(sku_rows)
+
+            for file_idx, r in enumerate(sku_rows, 1):
+                file_name = (r.get("File") or "").strip()
+                supplier = (r.get("Supplier") or "").strip()
+                duplicate_of = (r.get("Duplicate Of") or "").strip()
+
+                if duplicate_of:
                     yield OptimizeProgress(
-                        sku=t.sku, supplier=t.supplier, file_name=f["name"],
-                        file_index=file_idx, file_total=len(t.files),
-                        sku_index=sku_idx, sku_total=len(targets),
+                        sku=sku, supplier=supplier, file_name=file_name,
+                        file_index=file_idx, file_total=file_total,
+                        sku_index=sku_idx, sku_total=sku_total,
                         skipped=True,
                     )
                     continue
 
-                src_path = os.path.join(tmp, f["name"])
+                convert_jpg = _bool(r.get("Convert JPG"))
+                remove_bg = _bool(r.get("Remove BG"))
+                pad_square = _bool(r.get("Pad to Square"))
+                resize_flag = _bool(r.get("Resize"))
+                compress = _bool(r.get("Compress"))
+
+                # All-FALSE row → nothing to do (treat as opt-out).
+                if not (convert_jpg or remove_bg or pad_square or resize_flag or compress):
+                    yield OptimizeProgress(
+                        sku=sku, supplier=supplier, file_name=file_name,
+                        file_index=file_idx, file_total=file_total,
+                        sku_index=sku_idx, sku_total=sku_total,
+                        skipped=True,
+                    )
+                    continue
+
+                key = (sku, file_name)
+                if key not in file_index:
+                    # Source disappeared between dry-run and execute — skip with a marker.
+                    yield OptimizeProgress(
+                        sku=sku, supplier=supplier, file_name=file_name,
+                        file_index=file_idx, file_total=file_total,
+                        sku_index=sku_idx, sku_total=sku_total,
+                        skipped=True,
+                    )
+                    continue
+                t, f = file_index[key]
+
+                dest_id, existing_names = _dest_for(t)
+                out_name = Path(file_name).stem + ".jpg"
+                if out_name in existing_names:
+                    yield OptimizeProgress(
+                        sku=sku, supplier=supplier, file_name=file_name,
+                        file_index=file_idx, file_total=file_total,
+                        sku_index=sku_idx, sku_total=sku_total,
+                        skipped=True,
+                    )
+                    continue
+
+                src_path = os.path.join(tmp, file_name)
                 drive.download_file(f["id"], src_path)
 
                 with Image.open(src_path) as src_img:
-                    optimized = optimize_image(src_img, cfg)
+                    optimized = optimize_image(
+                        src_img, cfg,
+                        clean_bg=remove_bg,
+                        pad_to_square=pad_square,
+                        resize=resize_flag,
+                    )
 
                 out_path = os.path.join(tmp, out_name)
-                save_jpeg(optimized, out_path, cfg)
+                save_jpeg(optimized, out_path, cfg, compress=compress)
                 drive.upload_file(out_path, dest_id, out_name, "image/jpeg")
-                existing.add(out_name)
+                existing_names.add(out_name)
 
-                # Free disk for the next file.
                 try:
                     os.unlink(src_path)
                 except OSError:
@@ -403,8 +613,8 @@ def execute(
                     pass
 
                 yield OptimizeProgress(
-                    sku=t.sku, supplier=t.supplier, file_name=f["name"],
-                    file_index=file_idx, file_total=len(t.files),
-                    sku_index=sku_idx, sku_total=len(targets),
+                    sku=sku, supplier=supplier, file_name=file_name,
+                    file_index=file_idx, file_total=file_total,
+                    sku_index=sku_idx, sku_total=sku_total,
                     skipped=False,
                 )

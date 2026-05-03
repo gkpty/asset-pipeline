@@ -86,11 +86,29 @@ def build_plan(
     clean: bool = False,
     move_unknown: bool = False,
     typo_cutoff: float = 0.65,
+    internal_dirs: list[str] | None = None,
 ) -> list[Action]:
-    """Walk the products drive and emit the actions needed to scaffold/fix/clean it."""
+    """Walk the products drive and emit the actions needed to scaffold/fix/clean it.
+
+    `internal_dirs`: if provided, only subdirs whose rel_path is in this list
+    get CREATE_SUBDIR actions. When None, every entry in `paths.entries()` is
+    scaffolded (current default). Used for categories like upholstery that
+    only need a photos/ folder, not the full product subdir tree.
+    Note: this only filters what gets *created*. Cleanup (`--clean`) and
+    file routing (`--fix`) still use the full canonical paths set.
+    """
     actions: list[Action] = []
     canonical_top = _canonical_top_level_dirs(paths)
     canonical_top_lower = {c.lower(): c for c in canonical_top}
+
+    # Resolve which paths to scaffold. Filter by rel_path, not by key — the
+    # CLI passes the visible folder names (photos, lifestyle, models/dwg).
+    all_entries = paths.entries()
+    if internal_dirs is None:
+        scaffold_entries = all_entries
+    else:
+        wanted = {d.strip().lower() for d in internal_dirs if d.strip()}
+        scaffold_entries = [e for e in all_entries if e[2].lower() in wanted]
 
     # 1. Snapshot existing drive structure
     if structure == "flat":
@@ -135,8 +153,9 @@ def build_plan(
 
     for sku, supplier, sku_id in all_skus:
         if sku_id is None:
-            # New SKU: emit CREATE_SUBDIR for every canonical path.
-            for _key, _disp, rel_path in paths.entries():
+            # New SKU: emit CREATE_SUBDIR for every canonical path (or only
+            # those in internal_dirs if a filter was passed).
+            for _key, _disp, rel_path in scaffold_entries:
                 actions.append(Action(
                     kind="CREATE_SUBDIR", sku=sku, supplier=supplier,
                     description=f"Create '{rel_path}/' inside new SKU",
@@ -208,9 +227,10 @@ def build_plan(
         for old, new in renamed_to.items():
             existing_subdirs[new] = existing_subdirs.pop(old)
 
-        # 3c. CREATE_SUBDIR for missing canonical paths (with caching)
+        # 3c. CREATE_SUBDIR for missing canonical paths (with caching).
+        # Honors --internal-dirs by iterating only over the filtered entries.
         folder_cache: dict[str, dict[str, str]] = {sku_id: dict(existing_subdirs)}
-        for _key, _disp, rel_path in paths.entries():
+        for _key, _disp, rel_path in scaffold_entries:
             current_id = sku_id
             for part in rel_path.split("/"):
                 if current_id not in folder_cache:

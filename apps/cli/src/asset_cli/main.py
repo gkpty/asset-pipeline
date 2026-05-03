@@ -896,6 +896,629 @@ def regroup(
     )
 
 
+# ---------------------------------------------------------------------------
+# generate
+# ---------------------------------------------------------------------------
+
+# Asset kinds that the "copy from siblings" strategy supports. Each maps to a
+# config key on `paths.input` whose value is the relative path to walk.
+_COPY_FROM_SIBLINGS_KINDS = {
+    "assembly_instructions": "assembly_instructions",
+    "diagram":               "diagram",
+    "models_dwg":            "models_dwg",
+}
+
+
+@app.command("generate")
+def generate(
+    asset_type: str = typer.Option(
+        ..., "--type",
+        help=("Asset type(s) to generate. Copy-from-siblings supports comma-separated "
+              "values and the 'all' shortcut: e.g. 'diagram', 'diagram,models_dwg', "
+              "'all'. Render mode is barcode-only. Photos mode is photos-only."),
+    ),
+    config_path: Path = typer.Option(
+        Path("pipeline.config.toml"),
+        envvar="PIPELINE_CONFIG_PATH",
+        help="Path to pipeline.config.toml.",
+    ),
+    root_folder_id: str = typer.Option(
+        ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
+        help="Google Drive parent folder ID (contains category subfolders).",
+    ),
+    sheet_id: str = typer.Option(
+        ..., envvar="GOOGLE_SHEETS_MASTER_ID",
+        help="Google Sheets file ID.",
+    ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root: products, materials, … (default: products).",
+    ),
+    tab: Optional[str] = typer.Option(
+        None, help="Sheet tab with the SKU list. Defaults to the category name.",
+    ),
+    report_tab: Optional[str] = typer.Option(
+        None, help="Tab to write the report into. Defaults to '<generate.report_tab> - <Type> - <Category>'.",
+    ),
+    sku_filter: Optional[str] = typer.Option(
+        None, "--sku",
+        help="Limit to a single SKU. Filters both the dry-run report and the execute set. "
+             "Useful for spot-testing one row before running the full batch.",
+    ),
+    action_filter: Optional[str] = typer.Option(
+        None, "--action",
+        help="(--type photos) Limit to a single action: 'copy' or 'generate'. "
+             "Filters the dry-run report and the execute set.",
+    ),
+    models: Optional[str] = typer.Option(
+        None, "--models",
+        help=("(--type photos) Comma-separated list of models tried in order, "
+              "cycling on retry. Provider auto-detected from prefix (gpt-* → "
+              "OpenAI, gemini-* → Google). Default: see generate.photos.models in config."),
+    ),
+    quality: Optional[str] = typer.Option(
+        None, "--quality",
+        help="(--type photos) Override generate.photos.quality: low | medium | high.",
+    ),
+    cost_per_image: Optional[float] = typer.Option(
+        None, "--cost-per-image",
+        help="(--type photos) Override the per-image cost used for estimates. "
+             "Without this flag, cost auto-derives from --quality.",
+    ),
+    budget: Optional[float] = typer.Option(
+        None, "--budget",
+        help="(--type photos --execute) Hard pre-flight cost ceiling in USD "
+             "(worst-case incl. retries). Run aborts before any API call if exceeded.",
+    ),
+    no_verify: bool = typer.Option(
+        False, "--no-verify",
+        help="(--type photos --execute) Skip the Claude-vision QA loop. Faster + "
+             "cheaper but no automatic retries on visibly-wrong outputs.",
+    ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help="(--type photos --execute) Save every rejected attempt to "
+             "<sku>/photos/failed_generations/ on Drive for review. Useful for "
+             "diagnosing why a model keeps producing wrong outputs.",
+    ),
+    max_retries: Optional[int] = typer.Option(
+        None, "--max-retries",
+        help="(--type photos --execute) Override generate.photos.max_retries (default: 2). "
+             "Each retry costs another generation + verification call.",
+    ),
+    execute: bool = typer.Option(
+        False, "--execute",
+        help="Read the (possibly edited) report and apply. Omit for a dry run.",
+    ),
+) -> None:
+    """
+    Generate missing assets for SKUs in a category.
+
+    Three strategies, dispatched by --type:
+
+      - assembly_instructions / diagram / models_dwg → copy from a sibling SKU
+        sharing the same parent_product. Tie-break: first sibling in sheet
+        row order that has files.
+
+      - barcode → render a Code-128 label image from the sheet's barcode
+        column and upload to <sku>/<barcode-subdir>/<sku>.jpg.
+
+      - photos → for each SKU missing photos, pick a sibling with photos under
+        the same parent_product, resolve material reference photos for any
+        material columns whose values differ, and call gpt-image-1 to produce
+        N outputs (matching sibling's photo count). Cost is estimated in the
+        dry-run report; --budget enforces a hard pre-flight ceiling on execute.
+
+    Dry run scans, builds a plan, writes a report tab. Edit that tab as needed
+    (change Source SKU, set Action=SKIP, fix barcode strings, etc.) then re-run
+    with --execute to apply.
+    """
+    from rich.table import Table
+
+    from asset_sdk.adapters import drive
+    from asset_sdk.adapters.sheets import read_rows, write_report
+    from asset_sdk.config import PipelineConfig
+
+    cfg = PipelineConfig.load(config_path)
+
+    # Parse --type FIRST so a bad value fails fast before any Drive calls.
+    requested = [t.strip().lower() for t in asset_type.split(",") if t.strip()]
+    if requested == ["all"]:
+        requested = sorted(_COPY_FROM_SIBLINGS_KINDS.keys())
+    if not requested:
+        raise typer.BadParameter("--type cannot be empty.")
+
+    # Validate --action up front. Stored as upper-case for plan comparison.
+    action_filter_norm: Optional[str] = None
+    if action_filter is not None:
+        af = action_filter.strip().lower()
+        if af not in ("copy", "generate"):
+            raise typer.BadParameter(
+                f"--action must be 'copy' or 'generate' (got {action_filter!r})"
+            )
+        action_filter_norm = af.upper()
+
+    sku_filter_norm: Optional[str] = (sku_filter.strip() if sku_filter else None) or None
+
+    def _apply_filters(plans_list):
+        """Filter a plan list by --sku / --action. No-op if neither flag set."""
+        out = plans_list
+        if sku_filter_norm is not None:
+            out = [p for p in out if p.sku == sku_filter_norm]
+        if action_filter_norm is not None:
+            out = [p for p in out if p.action == action_filter_norm]
+        return out
+
+    # Barcode and photos are exclusive single-type modes (their report shapes differ
+    # from each other and from the copy-from-siblings report).
+    if "barcode" in requested:
+        if len(requested) > 1:
+            raise typer.BadParameter(
+                "--type barcode cannot be combined with other types (different report shape)."
+            )
+        type_label = "Barcode"
+    elif "photos" in requested:
+        if len(requested) > 1:
+            raise typer.BadParameter(
+                "--type photos cannot be combined with other types (different report shape)."
+            )
+        type_label = "Photos"
+    else:
+        unsupported = [t for t in requested if t not in _COPY_FROM_SIBLINGS_KINDS]
+        if unsupported:
+            raise typer.BadParameter(
+                f"Unsupported --type values: {', '.join(unsupported)}. "
+                f"Supported: barcode, photos, "
+                f"{', '.join(sorted(_COPY_FROM_SIBLINGS_KINDS))}, "
+                f"or comma-separated combinations / 'all'."
+            )
+        if len(requested) == 1:
+            type_label = requested[0].replace("_", " ").title()
+        elif sorted(requested) == sorted(_COPY_FROM_SIBLINGS_KINDS.keys()):
+            type_label = "All"
+        else:
+            type_label = " + ".join(t.replace("_", " ").title() for t in requested)
+
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+    structure = cfg.structure_for(category)
+    _tab = tab or category
+    _report_tab = report_tab or f"{cfg.generate.report_tab} - {type_label} - {category.title()}"
+
+    # ------------------ BARCODE ------------------
+    if requested == ["barcode"]:
+        from asset_sdk.stages.generate_barcodes import (
+            build_plan as bp_barcode,
+            execute as run_barcode,
+            summarise as sum_barcode,
+            to_sheet_rows as rows_barcode,
+        )
+        barcode_subdir = cfg.paths.barcode
+
+        if not execute:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+                t = progress.add_task(f"Reading '{_tab}' tab…", total=None)
+                sheet_rows = read_rows(sheet_id, _tab)
+                progress.update(t, description=f"Read {len(sheet_rows)} rows from '{_tab}'")
+                progress.stop_task(t)
+
+                t = progress.add_task(f"Scanning {category} drive for existing barcodes…", total=None)
+                plans = bp_barcode(
+                    category_folder_id, structure, sheet_rows,
+                    cfg.csv.sku_column, cfg.csv.supplier_column, cfg.csv.barcode_column,
+                    barcode_subdir,
+                )
+                progress.update(t, description=f"Built plan: {len(plans)} entries")
+                progress.stop_task(t)
+
+                # Apply --sku / --action filters before writing the report.
+                plans = _apply_filters(plans)
+
+                t = progress.add_task(f"Writing report to '{_report_tab}'…", total=None)
+                headers, rows = rows_barcode(plans)
+                write_report(sheet_id, _report_tab, headers, rows)
+                progress.update(t, description=f"Report written → '{_report_tab}'")
+                progress.stop_task(t)
+
+            counts = sum_barcode(plans)
+            console.print()
+            console.print(
+                f"[bold]Dry run complete[/bold] — {counts['to_generate']} barcodes to generate, "
+                f"{counts['skipped']} skipped."
+            )
+            console.print(
+                f"\nReview '{_report_tab}', edit any wrong barcodes / actions, "
+                "then re-run with --execute."
+            )
+            return
+
+        # ----- Execute -----
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            t = progress.add_task(f"Reading report '{_report_tab}'…", total=None)
+            report_rows = read_rows(sheet_id, _report_tab)
+            progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
+            progress.stop_task(t)
+
+        # Apply --sku / --action filters to the report rows before execute.
+        if sku_filter_norm:
+            report_rows = [r for r in report_rows if (r.get("SKU") or "").strip() == sku_filter_norm]
+        if action_filter_norm:
+            report_rows = [
+                r for r in report_rows
+                if (r.get("Action") or "").strip().upper() == action_filter_norm
+            ]
+
+        actionable = sum(1 for r in report_rows if (r.get("Action") or "").strip().upper() == "GENERATE")
+        if actionable == 0:
+            console.print("[yellow]Nothing to generate.[/yellow]")
+            return
+
+        bar = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            console=console,
+        )
+        generated = errored = 0
+        with bar:
+            bar_task = bar.add_task("Generating barcodes…", total=actionable, completed=0)
+            for prog in run_barcode(report_rows, category_folder_id, structure, barcode_subdir):
+                if prog.error:
+                    errored += 1
+                    bar.update(
+                        bar_task,
+                        description=f"  [red]err[/red] {prog.sku}: {prog.error}",
+                        advance=1,
+                    )
+                else:
+                    generated += 1
+                    bar.update(
+                        bar_task,
+                        description=f"  [green]ok[/green] {prog.sku} ({prog.barcode})",
+                        advance=1,
+                    )
+
+        console.print(
+            f"\n[bold]Barcode generation complete[/bold]  "
+            f"({generated} generated, {errored} errored)"
+        )
+        return
+
+    # ------------------ PHOTOS ------------------
+    if requested == ["photos"]:
+        from asset_sdk.stages.generate_photos import (
+            build_plan as bp_photos,
+            execute as run_photos,
+            summarise as sum_photos,
+            to_sheet_rows as rows_photos,
+        )
+        photos_cfg = cfg.generate.photos
+        _quality = (quality or photos_cfg.quality).strip().lower()
+        if _quality not in ("low", "medium", "high"):
+            raise typer.BadParameter(
+                f"--quality must be low | medium | high (got {_quality!r})"
+            )
+        # Resolve models list: CLI override → config default. Validates the
+        # provider prefix per entry so a typo fails fast.
+        if models:
+            _models = [m.strip() for m in models.split(",") if m.strip()]
+        else:
+            _models = list(photos_cfg.models)
+        if not _models:
+            raise typer.BadParameter("--models must list at least one model")
+        from asset_sdk.stages.generate_photos import _provider_for as _detect_provider
+        for m in _models:
+            try:
+                _detect_provider(m)
+            except Exception as exc:
+                raise typer.BadParameter(str(exc))
+        # Per-model pricing: primary cost = first model in cycle; worst case
+        # cycles through all models (1 + max_retries attempts). --cost-per-image
+        # overrides both with a flat value (legacy behavior).
+        from asset_sdk.config import _QUALITY_COST_USD as _Q_COST
+        # Update cost_per_image_usd in case --quality differs from the config default.
+        photos_cfg.cost_per_image_usd = _Q_COST.get(_quality, photos_cfg.cost_per_image_usd)
+        _verify_enabled = photos_cfg.verify_enabled and not no_verify
+        _max_retries = max_retries if max_retries is not None else photos_cfg.max_retries
+        if _max_retries < 0:
+            raise typer.BadParameter("--max-retries must be >= 0")
+        if cost_per_image is not None:
+            _primary_cost = float(cost_per_image)
+            _worst_per_image = _primary_cost * (1 + _max_retries)
+        else:
+            _primary_cost = photos_cfg.cost_for(_models[0])
+            _worst_per_image = photos_cfg.worst_case_cost_per_image(_models, _max_retries)
+        _cost_per = _primary_cost  # used by build_plan for the per-row cost column
+        photos_subdir = cfg.paths.product_photos
+
+        # Read the sheet + build plans (used by both dry-run and execute).
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            t = progress.add_task(f"Reading '{_tab}' tab…", total=None)
+            sheet_rows = read_rows(sheet_id, _tab)
+            progress.update(t, description=f"Read {len(sheet_rows)} rows from '{_tab}'")
+            progress.stop_task(t)
+
+            t = progress.add_task(f"Scanning {category} drive + resolving materials…", total=None)
+            plans = bp_photos(
+                parent_root_id=root_folder_id,
+                category_folder_id=category_folder_id,
+                structure=structure,
+                sheet_rows=sheet_rows,
+                sku_col=cfg.csv.sku_column,
+                supplier_col=cfg.csv.supplier_column,
+                parent_product_col=cfg.csv.parent_product_column,
+                photos_subdir=photos_subdir,
+                material_columns=photos_cfg.material_columns,
+                cost_per_image_usd=_cost_per,
+                part_col=cfg.csv.part_column,
+                size_col=cfg.csv.size_column,
+            )
+            progress.update(t, description=f"Built plan: {len(plans)} entries")
+            progress.stop_task(t)
+
+        # Apply --sku / --action filters. Affects both the dry-run report and execute.
+        plans = _apply_filters(plans)
+        if sku_filter_norm or action_filter_norm:
+            console.print(
+                f"[dim]Filtered to {len(plans)} entries[/dim]"
+                + (f" (sku={sku_filter_norm!r})" if sku_filter_norm else "")
+                + (f" (action={action_filter_norm!r})" if action_filter_norm else "")
+            )
+
+        counts = sum_photos(plans)
+
+        if not execute:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+                t = progress.add_task(f"Writing report to '{_report_tab}'…", total=None)
+                headers, rows = rows_photos(plans, photos_cfg.material_columns)
+                write_report(sheet_id, _report_tab, headers, rows)
+                progress.update(t, description=f"Report written → '{_report_tab}'")
+                progress.stop_task(t)
+
+            console.print()
+            # Cost ranges: best case = 1 attempt per image; worst case = 1 + max_retries.
+            best_case = counts['total_cost_usd']
+            # Per-model worst-case (cycles through models on retry — Gemini and
+            # GPT may have different costs).
+            worst_case = round(counts['total_images'] * _worst_per_image, 4)
+            verify_note = (
+                f", verifier={photos_cfg.verify_model}, retries up to {_max_retries}"
+                if _verify_enabled else ", verifier OFF"
+            )
+            console.print(
+                f"[bold]Dry run complete[/bold] — "
+                f"{counts['to_copy']} SKUs to copy ({counts['copy_images']} images, $0), "
+                f"{counts['to_generate']} SKUs to generate "
+                f"({counts['total_images']} images, ~${best_case:.2f} best case "
+                f"/ ~${worst_case:.2f} worst case{verify_note}), "
+                f"{counts['skipped']} skipped."
+            )
+            console.print(
+                f"\nReview '{_report_tab}' (COPY rows are listed first, then GENERATE). "
+                "Edit Action/Source SKU/material columns to override, then re-run with "
+                "--execute (and --budget to set a hard cost cap; pass --no-verify to skip the QA loop)."
+            )
+            return
+
+        # ----- Execute -----
+        # Re-read the report so user edits to Action / Source SKU / material columns are honored.
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            t = progress.add_task(f"Reading report '{_report_tab}'…", total=None)
+            report_rows = read_rows(sheet_id, _report_tab)
+            progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
+            progress.stop_task(t)
+
+        # Honor user edits to the Action column. Both COPY and GENERATE are actionable.
+        actionable_skus = {
+            (r.get("SKU") or "").strip()
+            for r in report_rows
+            if (r.get("Action") or "").strip().upper() in ("COPY", "GENERATE")
+        }
+        runnable = [
+            p for p in plans
+            if p.action in ("COPY", "GENERATE") and p.sku in actionable_skus
+        ]
+        # Run COPYs before GENERATEs: cheap operations finish first, no API risk.
+        runnable.sort(key=lambda p: 0 if p.action == "COPY" else 1)
+
+        runnable_copy_count = sum(1 for p in runnable if p.action == "COPY")
+        runnable_gen_count = sum(1 for p in runnable if p.action == "GENERATE")
+        runnable_copy_images = sum(p.photo_count for p in runnable if p.action == "COPY")
+        runnable_gen_images = sum(p.photo_count for p in runnable if p.action == "GENERATE")
+        runnable_best_cost = round(sum(p.cost_usd for p in runnable), 4)  # COPY rows are 0
+        # Worst-case sums per-attempt costs across the model cycle (Gemini + GPT
+        # may differ in cost), so this is more accurate than `best × (1+retries)`.
+        runnable_worst_cost = round(runnable_gen_images * _worst_per_image, 4)
+        runnable_image_count = runnable_copy_images + runnable_gen_images
+
+        if not runnable:
+            console.print("[yellow]Nothing to do (no rows with Action=COPY or GENERATE matched).[/yellow]")
+            return
+
+        # Pre-flight budget check uses worst-case cost (every shot retries N times)
+        # so the budget is a hard ceiling, not a maybe.
+        if budget is not None and runnable_worst_cost > float(budget):
+            console.print(
+                f"[red]Aborted:[/red] worst-case AI cost "
+                f"${runnable_worst_cost:.2f} (best ${runnable_best_cost:.2f}) "
+                f"exceeds --budget ${float(budget):.2f}. "
+                f"({runnable_gen_count} GENERATE SKUs / {runnable_gen_images} images, "
+                f"max {_max_retries} retries each.)"
+            )
+            console.print(
+                "Set Action=SKIP on GENERATE rows you don't want, lower --max-retries, or raise --budget."
+            )
+            raise typer.Exit(1)
+
+        verify_status = "ON" if _verify_enabled else "OFF"
+        console.print(
+            f"[bold]Running[/bold] {runnable_copy_count} COPYs ({runnable_copy_images} files) + "
+            f"{runnable_gen_count} GENERATEs ({runnable_gen_images} images, "
+            f"~${runnable_best_cost:.2f}–${runnable_worst_cost:.2f}, "
+            f"models={_models}, quality={_quality}, "
+            f"verify={verify_status}, retries={_max_retries})."
+        )
+
+        # Stage emits its own per-step logs via `logger=console.print`. We don't
+        # use a progress bar here because line-by-line output (prompt, generating,
+        # verifying, upload) is what the user actually needs to debug failures.
+        # `prog` events from the stage are summarized after the stream ends.
+        generated = errored = skipped = 0
+        for prog in run_photos(
+            plans=runnable,
+            parent_root_id=root_folder_id,
+            category_folder_id=category_folder_id,
+            structure=structure,
+            photos_subdir=photos_subdir,
+            material_columns=photos_cfg.material_columns,
+            models=_models,
+            quality=_quality,
+            size=photos_cfg.size,
+            verify_enabled=_verify_enabled,
+            verify_model=photos_cfg.verify_model,
+            max_retries=_max_retries,
+            debug=debug,
+            logger=console.print,
+        ):
+            if prog.error:
+                if prog.skipped:
+                    skipped += 1
+                else:
+                    errored += 1
+            else:
+                generated += 1
+
+        console.print(
+            f"\n[bold]Photo generation complete[/bold]  "
+            f"({generated} generated, {skipped} skipped, {errored} errored)"
+        )
+        return
+
+    # ------------------ COPY FROM SIBLINGS (one or many kinds) ------------------
+    # Build {type_label: rel_path} for the kinds we'll process.
+    kind_paths = {
+        kind: getattr(cfg.paths, _COPY_FROM_SIBLINGS_KINDS[kind])
+        for kind in requested
+    }
+
+    from asset_sdk.stages.generate_from_siblings import (
+        _build_sku_index,
+        build_plan as bp_copy,
+        execute as run_copy,
+        summarise as sum_copy,
+        to_sheet_rows as rows_copy,
+    )
+
+    if not execute:
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            t = progress.add_task(f"Reading '{_tab}' tab…", total=None)
+            sheet_rows = read_rows(sheet_id, _tab)
+            progress.update(t, description=f"Read {len(sheet_rows)} rows from '{_tab}'")
+            progress.stop_task(t)
+
+            t = progress.add_task(f"Indexing {category} drive…", total=None)
+            sku_index = _build_sku_index(category_folder_id, structure)
+            progress.update(t, description=f"Indexed {len(sku_index)} SKU folders")
+            progress.stop_task(t)
+
+            plans = []
+            for kind, kind_path in kind_paths.items():
+                t = progress.add_task(f"Scanning for {kind_path}/ across SKUs…", total=None)
+                plans.extend(bp_copy(
+                    category_folder_id, structure, sheet_rows,
+                    cfg.csv.sku_column, cfg.csv.supplier_column, cfg.csv.parent_product_column,
+                    kind, kind_path, sku_index=sku_index,
+                    part_col=cfg.csv.part_column,
+                ))
+                progress.update(t, description=f"Built plan for {kind}")
+                progress.stop_task(t)
+
+            # Apply --sku / --action filters before writing the report.
+            plans = _apply_filters(plans)
+
+            t = progress.add_task(f"Writing report to '{_report_tab}'…", total=None)
+            headers, rows = rows_copy(plans)
+            write_report(sheet_id, _report_tab, headers, rows)
+            progress.update(t, description=f"Report written → '{_report_tab}'")
+            progress.stop_task(t)
+
+        counts = sum_copy(plans)
+        console.print()
+        console.print(
+            f"[bold]Dry run complete[/bold] — {counts['to_copy']} copies planned across "
+            f"{len(kind_paths)} type(s), {counts['skipped']} skipped."
+        )
+        console.print(
+            f"\nReview '{_report_tab}', edit any Source SKU / Type / Action you want to "
+            "override, then re-run with --execute."
+        )
+        return
+
+    # ----- Execute -----
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        t = progress.add_task(f"Reading report '{_report_tab}'…", total=None)
+        report_rows = read_rows(sheet_id, _report_tab)
+        progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
+        progress.stop_task(t)
+
+    # Apply --sku / --action filters to the report rows before execute.
+    if sku_filter_norm:
+        report_rows = [r for r in report_rows if (r.get("SKU") or "").strip() == sku_filter_norm]
+    if action_filter_norm:
+        report_rows = [
+            r for r in report_rows
+            if (r.get("Action") or "").strip().upper() == action_filter_norm
+        ]
+
+    actionable = sum(1 for r in report_rows if (r.get("Action") or "").strip().upper() == "COPY")
+    if actionable == 0:
+        console.print("[yellow]Nothing to copy.[/yellow]")
+        return
+
+    bar = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=30),
+        MofNCompleteColumn(),
+        console=console,
+    )
+    copied = skipped = errored = 0
+    current_key: tuple[str, str] | None = None
+    with bar:
+        # Total advances once per (sku, kind) actionable group, not per file.
+        bar_task = bar.add_task("Copying…", total=actionable, completed=0)
+        for prog in run_copy(report_rows, category_folder_id, structure, kind_paths):
+            label = "skip" if prog.skipped else "ok"
+            colour = "yellow" if prog.skipped else "green"
+            if prog.error:
+                colour = "red"
+                label = "err"
+                errored += 1
+            elif prog.skipped:
+                skipped += 1
+            else:
+                copied += 1
+
+            key = (prog.sku, prog.kind)
+            advance = 1 if current_key != key else 0
+            current_key = key
+            extra = f": {prog.error}" if prog.error else ""
+            bar.update(
+                bar_task,
+                description=(
+                    f"  [{colour}]{label}[/{colour}] "
+                    f"[{prog.kind}] {prog.sku} ← {prog.source_sku} "
+                    f"({prog.file_index}/{prog.file_total}){extra}"
+                ),
+                advance=advance,
+            )
+
+    console.print(
+        f"\n[bold]Copy complete[/bold]  "
+        f"({copied} files copied, {skipped} skipped, {errored} errored)"
+    )
+
+
 def _optimize_models(
     cfg,
     sku_filter,
@@ -1192,11 +1815,11 @@ def optimize(
             progress.stop_task(t)
 
         n_bg = sum(1 for a in analyses if a.has_background)
-        n_resize = sum(
-            1 for a in analyses
-            if a.current_width != opt_cfg.target_size or a.current_height != opt_cfg.target_size
-        )
+        n_dup = sum(1 for a in analyses if a.is_duplicate_of)
+        n_non_square = sum(1 for a in analyses if a.aspect_label != "1:1")
         n_format = sum(1 for a in analyses if a.current_format != "JPEG")
+        total_current_mb = sum(a.current_size_bytes for a in analyses) / 1024 / 1024
+        total_target_mb = sum(a.target_size_bytes for a in analyses) / 1024 / 1024
 
         console.print()
         console.print(
@@ -1204,19 +1827,40 @@ def optimize(
             f"{len(errors)} errors)"
         )
         console.print(f"  [yellow]Has background[/yellow]    {n_bg}")
-        console.print(f"  [yellow]Wrong dimensions[/yellow]  {n_resize}")
+        console.print(f"  [yellow]Non-square aspect[/yellow] {n_non_square}")
         console.print(f"  [yellow]Non-JPEG format[/yellow]   {n_format}")
+        console.print(f"  [magenta]Duplicates[/magenta]      {n_dup}")
+        console.print(
+            f"  [green]Total size[/green]      {total_current_mb:.1f}MB → {total_target_mb:.1f}MB"
+        )
         for e in errors[:10]:
             console.print(f"  [red]error[/red] {e}")
         if len(errors) > 10:
             console.print(f"  [red]…and {len(errors) - 10} more errors[/red]")
         console.print(
-            f"\nReview '{_report_tab}' in your Sheet, then re-run with --execute "
-            f"to optimize {len(analyses)} images."
+            f"\nReview '{_report_tab}' (edit Remove BG / Pad to Square / etc. as needed), "
+            f"then re-run with --execute."
         )
         return
 
-    table = Table(title=f"Optimization plan ({total_files} images / {len(targets)} SKUs)")
+    # ----- Execute -----
+    # Read back the (possibly-edited) report and apply per-row action flags.
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+        t = progress.add_task(f"Reading report '{_report_tab}'…", total=None)
+        report_rows = read_rows(sheet_id, _report_tab)
+        progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
+        progress.stop_task(t)
+
+    actionable = [
+        r for r in report_rows
+        if not (r.get("Duplicate Of") or "").strip()
+        and any(
+            (r.get(c) or "").strip().upper() in ("TRUE", "YES", "Y", "1", "T")
+            for c in ("Convert JPG", "Remove BG", "Pad to Square", "Resize", "Compress")
+        )
+    ]
+
+    table = Table(title=f"Optimization plan ({len(actionable)} actionable / {len(report_rows)} rows)")
     table.add_column("Supplier")
     table.add_column("SKU")
     table.add_column("Images", justify="right")
@@ -1231,6 +1875,10 @@ def optimize(
         table.caption = f"… and {len(targets) - PREVIEW} more SKUs"
     console.print(table)
 
+    if not actionable:
+        console.print("[yellow]Nothing to do (no rows with TRUE action flags).[/yellow]")
+        return
+
     bar = Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
@@ -1240,8 +1888,8 @@ def optimize(
     )
     processed = skipped = 0
     with bar:
-        bar_task = bar.add_task("Optimizing…", total=total_files, completed=0)
-        for p in run_optimize(targets, opt_cfg):
+        bar_task = bar.add_task("Optimizing…", total=len(report_rows), completed=0)
+        for p in run_optimize(report_rows, targets, opt_cfg):
             label = "skip" if p.skipped else "ok"
             bar.update(
                 bar_task,
@@ -1304,6 +1952,13 @@ def scaffold(
         False, "--move",
         help="With --clean: move non-canonical dirs into MOVED_FOLDER instead of deleting.",
     ),
+    internal_dirs: Optional[str] = typer.Option(
+        None, "--internal-dirs",
+        help="Comma-separated list of subdir paths to scaffold inside each SKU "
+             "(e.g. 'photos' or 'photos,lifestyle,models/dwg'). When omitted, the "
+             "full canonical set from paths.input is scaffolded. Use this for "
+             "categories like upholstery that only need a photos folder.",
+    ),
     execute: bool = typer.Option(
         False, "--execute",
         help="Apply the planned actions in Drive. Omit for a dry run.",
@@ -1329,6 +1984,22 @@ def scaffold(
     )
 
     cfg = PipelineConfig.load(config_path)
+
+    # Resolve --internal-dirs FIRST so a typo fails fast before the Drive call.
+    _internal_dirs: Optional[list[str]] = None
+    if internal_dirs is not None:
+        _internal_dirs = [d.strip() for d in internal_dirs.split(",") if d.strip()]
+        known_paths = {e[2] for e in cfg.paths.entries()}
+        unknown = [d for d in _internal_dirs if d not in known_paths]
+        if unknown:
+            raise typer.BadParameter(
+                f"--internal-dirs contains unknown paths: {', '.join(unknown)}. "
+                f"Known paths: {', '.join(sorted(known_paths))}"
+            )
+        console.print(
+            f"[dim]--internal-dirs: only scaffolding {_internal_dirs}[/dim]"
+        )
+
     category_folder_id = drive.resolve_category_folder(root_folder_id, category)
     _tab        = tab        or category
     _sku_col    = cfg.csv.sku_column
@@ -1351,6 +2022,7 @@ def scaffold(
             cfg.paths, cfg.structure_for(category),
             fix=fix, clean=clean, move_unknown=move_unknown,
             typo_cutoff=cfg.scaffold.typo_cutoff,
+            internal_dirs=_internal_dirs,
         )
         progress.update(t, description=f"Built plan: {len(actions)} actions")
         progress.stop_task(t)

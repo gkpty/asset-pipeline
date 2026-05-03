@@ -18,6 +18,15 @@ name_column            = "name"
 supplier_column        = "supplier"
 parent_product_column  = "parent product"
 supplier_ref_column = "supplier ref"
+barcode_column      = "barcode"
+# For modular products: two SKUs can share a parent_product but be different
+# physical parts (left armrest vs corner piece). Sibling matching for `generate`
+# requires both parent_product AND part to match.
+part_column         = "part"
+# Photos can be duplicated verbatim across SKUs that share all materials but
+# differ only in size (queen→king, small pot→large pot). The COPY action in
+# `asset generate --type photos` requires sibling.size != target.size.
+size_column         = "size"
 
 [drive]
 # Default structure for a category, used when [categories.<name>] doesn't override.
@@ -47,7 +56,48 @@ report_tab = "Models Report"
 [scaffold]
 report_tab        = "Scaffold Report"
 moved_folder_name = "MOVED_FOLDER"             # fallback name used only if GOOGLE_DRIVE_MOVED_FOLDER_ID env var is unset
-typo_cutoff       = 0.65                       # difflib similarity above which a folder name is treated as a typo
+typo_cutoff       = 0.65
+
+[generate]
+report_tab = "Generate Report"
+
+[generate.photos]
+# Image-generation models tried in order, cycling on retry. attempt 1 →
+# models[0]; retry 1 → models[1]; retry 2 → models[0] (wraps). Provider is
+# detected from the prefix: gpt-* / dall-* → OpenAI, gemini-* → Google Gemini.
+# Single-element list = no alternation.
+models             = ["gemini-3.1-flash-image-preview", "gpt-image-2-2026-04-21"]
+
+# OpenAI quality knob (Gemini ignores). Auto-derives cost_per_image_usd if 0.0.
+quality            = "high"          # low | medium | high
+size               = "auto"          # "auto" → match source aspect; or 1024x1024 / 1536x1024 / 1024x1536
+cost_per_image_usd = 0.0             # 0 → auto-derive from quality
+
+# Claude-vision verifier. After each generated image, Claude reviews it
+# against the source + material refs and gates whether to keep or retry.
+verify_enabled     = true
+verify_model       = "claude-sonnet-4-6"
+max_retries        = 2
+
+[generate.photos.model_costs]
+# USD-per-image overrides for budget calculations. Models not listed here
+# fall back to cost_per_image_usd (auto-derived from `quality` for OpenAI
+# tiers: low=$0.011, medium=$0.063, high=$0.167). Update if pricing changes.
+"gemini-3.1-flash-image-preview" = 0.039
+"gpt-image-2-2026-04-21"         = 0.167   # estimate; verify when org access lands
+
+[generate.photos.material_columns]
+# Master sheet column → category subfolder under the Drive parent root.
+# A target SKU's value in each column resolves to <category>/<value>/photos/<first file>.
+material   = "materials"
+color      = "materials"
+top        = "materials"
+panel      = "materials"
+seat       = "materials"
+legs       = "materials"
+trim       = "materials"
+weaving    = "materials"
+upholstery = "upholstery"                       # difflib similarity above which a folder name is treated as a typo
 
 [optimize]
 # --- Photo settings ---
@@ -56,7 +106,7 @@ target_padding_pct    = 8      # padding around the detected product, % of canva
 white_threshold       = 245    # RGB ≥ this counts as background and gets clamped to pure white
 jpg_quality           = 85     # initial JPEG quality (auto-drops if max_file_mb is exceeded)
 max_file_mb           = 2.0    # drop quality until file fits under this
-output_subdir_suffix  = "_optimized"
+output_subdir_suffix  = "-optimized"   # photos → photos-optimized, lifestyle → lifestyle-optimized, etc.
 report_tab            = "Optimize Report"
 
 # --- Model settings ---

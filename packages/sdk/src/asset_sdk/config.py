@@ -14,6 +14,15 @@ class CsvConfig:
     supplier_column:        str = "supplier"
     parent_product_column:  str = "parent product"
     supplier_ref_column:    str = "supplier ref"
+    barcode_column:         str = "barcode"
+    # For modular products, two SKUs can share a parent_product but be physically
+    # different parts (e.g. left armrest vs corner piece) — siblings only count
+    # for asset reuse when this column also matches.
+    part_column:            str = "part"
+    # Photos can be duplicated verbatim across SKUs that share all materials but
+    # differ ONLY in size (queen→king, small pot→large pot). The COPY action in
+    # `asset generate --type photos` requires sibling.size != target.size.
+    size_column:            str = "size"
 
 
 @dataclass
@@ -43,6 +52,95 @@ class ModelsConfig:
     report_tab: str = "Models Report"
 
 
+_DEFAULT_MATERIAL_COLUMNS: dict[str, str] = {
+    "material":   "materials",
+    "color":      "materials",
+    "top":        "materials",
+    "panel":      "materials",
+    "seat":       "materials",
+    "legs":       "materials",
+    "trim":       "materials",
+    "weaving":    "materials",
+    "upholstery": "upholstery",
+}
+
+
+_QUALITY_COST_USD = {"low": 0.011, "medium": 0.063, "high": 0.167}
+
+# Per-model USD-per-image defaults. Used by the budget pre-flight to give
+# accurate cost estimates when the model cycle mixes providers with different
+# pricing. Override per-deployment in TOML under [generate.photos.model_costs].
+_DEFAULT_MODEL_COSTS: dict[str, float] = {
+    # Google Gemini Flash Image (≈$0.039/img per Gemini's published rate).
+    "gemini-3.1-flash-image-preview":  0.039,
+    "gemini-2.5-flash-image-preview":  0.039,
+    "gemini-2.5-flash-image":          0.039,
+    # OpenAI gpt-image-1 — quality-tiered. The dispatch falls back to the
+    # quality-derived cost_per_image_usd for OpenAI models not listed here,
+    # so we don't need a separate entry per quality tier.
+    "gpt-image-2-2026-04-21":          0.167,  # estimate; update when verified
+}
+
+
+@dataclass
+class PhotosGenerateConfig:
+    # Models tried in order, cycling on retry. attempt 1 → models[0]; retry 1 →
+    # models[1]; retry 2 → models[0] (wraps). Provider is detected from the
+    # model name prefix (gpt-* / dall-* → OpenAI, gemini-* → Google).
+    models:             list[str] = field(default_factory=lambda: [
+        "gpt-image-1",
+        "gemini-3.1-flash-image-preview",
+    ])
+    quality:            str   = "high"        # low | medium | high (OpenAI only; Gemini ignores)
+    size:               str   = "auto"        # "auto" → match source aspect; or 1024x1024 / 1536x1024 / 1024x1536
+    # cost_per_image_usd is the fallback per-image cost for any model not in
+    # `model_costs`. Auto-derived from `quality` if left at 0 (OpenAI tier
+    # pricing). model_costs overrides this on a per-model basis — set
+    # gemini-* entries there, leave gpt-image-1 to the quality-derived fallback.
+    cost_per_image_usd: float = 0.0
+    model_costs:        dict[str, float] = field(default_factory=lambda: dict(_DEFAULT_MODEL_COSTS))
+    # Verifier loop: after each generate call, ask Claude to QA the output.
+    # If verification fails, retry up to max_retries with the next model in the
+    # cycle (and the verifier's retry_instructions appended to the prompt).
+    # Disable per-run with --no-verify.
+    verify_enabled:     bool  = True
+    verify_model:       str   = "claude-sonnet-4-6"
+    max_retries:        int   = 2
+    # Map of master-sheet material column -> drive category subfolder under the parent root.
+    material_columns:   dict[str, str] = field(default_factory=lambda: dict(_DEFAULT_MATERIAL_COLUMNS))
+
+    def __post_init__(self) -> None:
+        if not self.cost_per_image_usd:
+            self.cost_per_image_usd = _QUALITY_COST_USD.get(self.quality.strip().lower(), 0.063)
+
+    def cost_for(self, model: str) -> float:
+        """USD per image for a given model. Falls back to cost_per_image_usd
+        (auto-derived from quality) for any model not in model_costs."""
+        m = model.strip()
+        if m in self.model_costs and self.model_costs[m]:
+            return float(self.model_costs[m])
+        # Case-insensitive match as a courtesy for sloppy TOML.
+        ml = m.lower()
+        for k, v in self.model_costs.items():
+            if k.lower() == ml and v:
+                return float(v)
+        return float(self.cost_per_image_usd)
+
+    def worst_case_cost_per_image(self, models: list[str], max_retries: int) -> float:
+        """Sum of per-image costs across all attempts (1 + max_retries),
+        cycling through `models`. Used for the budget pre-flight ceiling."""
+        if not models:
+            return 0.0
+        attempts = 1 + max(0, max_retries)
+        return sum(self.cost_for(models[i % len(models)]) for i in range(attempts))
+
+
+@dataclass
+class GenerateConfig:
+    report_tab: str = "Generate Report"
+    photos:     PhotosGenerateConfig = field(default_factory=PhotosGenerateConfig)
+
+
 @dataclass
 class ScaffoldConfig:
     report_tab:         str = "Scaffold Report"
@@ -60,7 +158,7 @@ class OptimizeConfig:
     white_threshold:       int   = 245
     jpg_quality:           int   = 85
     max_file_mb:           float = 2.0
-    output_subdir_suffix:  str   = "_optimized"
+    output_subdir_suffix:  str   = "-optimized"
     report_tab:            str   = "Optimize Report"
 
     # Model settings
@@ -125,6 +223,7 @@ class PipelineConfig:
     models:     ModelsConfig               = field(default_factory=ModelsConfig)
     scaffold:   ScaffoldConfig             = field(default_factory=ScaffoldConfig)
     optimize:   OptimizeConfig             = field(default_factory=OptimizeConfig)
+    generate:   GenerateConfig             = field(default_factory=GenerateConfig)
     paths:      InputPaths                 = field(default_factory=InputPaths)
     categories: dict[str, CategoryConfig]  = field(default_factory=dict)
 
@@ -148,6 +247,39 @@ class PipelineConfig:
         for name, section in (raw.get("categories") or {}).items():
             categories[name.strip().lower()] = _build(CategoryConfig, section)
 
+        # Nested photos config under [generate.photos] (and optional
+        # [generate.photos.material_columns] override map).
+        gen_raw = raw.get("generate", {}) or {}
+        photos_raw = gen_raw.get("photos", {}) or {}
+        material_columns_override = photos_raw.get("material_columns")
+        model_costs_override = photos_raw.get("model_costs")
+        # _build strips unknown keys; pull dict-valued sections into the
+        # dataclass manually below.
+        photos_section = {
+            k: v for k, v in photos_raw.items()
+            if k not in ("material_columns", "model_costs")
+        }
+        # Back-compat: pre-multi-provider configs used `model = "..."`. Migrate
+        # to a single-element `models = ["..."]` if the new key isn't set.
+        if "model" in photos_section and "models" not in photos_section:
+            photos_section["models"] = [photos_section.pop("model")]
+        else:
+            photos_section.pop("model", None)  # drop ignored legacy key
+        photos_cfg = _build(PhotosGenerateConfig, photos_section)
+        if isinstance(material_columns_override, dict):
+            photos_cfg.material_columns = {
+                str(k).strip().lower(): str(v).strip().lower()
+                for k, v in material_columns_override.items()
+            }
+        if isinstance(model_costs_override, dict):
+            # Merge user overrides on top of defaults so partial overrides work.
+            for k, v in model_costs_override.items():
+                photos_cfg.model_costs[str(k).strip()] = float(v)
+        # Build top-level GenerateConfig with the nested photos.
+        gen_top = {k: v for k, v in gen_raw.items() if k != "photos"}
+        generate_cfg = _build(GenerateConfig, gen_top)
+        generate_cfg.photos = photos_cfg
+
         return cls(
             csv=_build(CsvConfig, raw.get("csv", {})),
             drive=_build(DriveConfig, raw.get("drive", {})),
@@ -156,6 +288,7 @@ class PipelineConfig:
             models=_build(ModelsConfig, raw.get("models", {})),
             scaffold=_build(ScaffoldConfig, raw.get("scaffold", {})),
             optimize=_build(OptimizeConfig, raw.get("optimize", {})),
+            generate=generate_cfg,
             paths=_build(InputPaths, raw.get("paths", {}).get("input", {})),
             categories=categories,
         )

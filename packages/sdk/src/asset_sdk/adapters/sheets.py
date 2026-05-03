@@ -15,9 +15,20 @@ def get_spreadsheet_title(sheet_id: str) -> str:
 
 
 def read_rows(sheet_id: str, tab: str) -> list[dict[str, str]]:
-    """Return all rows from *tab* as a list of dicts keyed by header."""
+    """Return all rows from *tab* as a list of dicts keyed by header.
+
+    Every value is coerced to `str`. gspread's `get_all_records()` auto-parses
+    numeric-looking cells into int/float/bool, which breaks downstream callers
+    that uniformly do `.strip()`. Coercing here keeps the public contract
+    honest (the annotation says `dict[str, str]`) and removes a class of
+    "AttributeError: 'int' object has no attribute 'strip'" bugs.
+    """
     ws = _client().open_by_key(sheet_id).worksheet(tab)
-    return ws.get_all_records()
+    raw_rows = ws.get_all_records()
+    return [
+        {k: ("" if v is None else str(v)) for k, v in row.items()}
+        for row in raw_rows
+    ]
 
 
 def write_report(
