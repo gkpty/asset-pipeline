@@ -1198,37 +1198,31 @@ def generate(
             raise typer.BadParameter(
                 f"--quality must be low | medium | high (got {_quality!r})"
             )
-        # Resolve models list: CLI override → config default. Validates the
-        # provider prefix per entry so a typo fails fast.
+        # Model cycle: --models overrides config; otherwise use config defaults.
         if models:
             _models = [m.strip() for m in models.split(",") if m.strip()]
         else:
             _models = list(photos_cfg.models)
         if not _models:
-            raise typer.BadParameter("--models must list at least one model")
-        from asset_sdk.stages.generate_photos import _provider_for as _detect_provider
-        for m in _models:
-            try:
-                _detect_provider(m)
-            except Exception as exc:
-                raise typer.BadParameter(str(exc))
-        # Per-model pricing: primary cost = first model in cycle; worst case
-        # cycles through all models (1 + max_retries attempts). --cost-per-image
-        # overrides both with a flat value (legacy behavior).
-        from asset_sdk.config import _QUALITY_COST_USD as _Q_COST
-        # Update cost_per_image_usd in case --quality differs from the config default.
-        photos_cfg.cost_per_image_usd = _Q_COST.get(_quality, photos_cfg.cost_per_image_usd)
-        _verify_enabled = photos_cfg.verify_enabled and not no_verify
+            raise typer.BadParameter(
+                "no models configured — set --models or generate.photos.models in pipeline.config.toml"
+            )
+
         _max_retries = max_retries if max_retries is not None else photos_cfg.max_retries
         if _max_retries < 0:
             raise typer.BadParameter("--max-retries must be >= 0")
+        _verify_enabled = (not no_verify) and photos_cfg.verify_enabled
+
+        # Per-image cost: best-case = first model in cycle. Worst-case sums per
+        # attempt across the cycle (1 + max_retries attempts, wrapping). Each
+        # attempt also incurs one Claude verifier call when --no-verify is off,
+        # but at ~$0.005/call that's noise compared to image-gen pricing.
         if cost_per_image is not None:
-            _primary_cost = float(cost_per_image)
-            _worst_per_image = _primary_cost * (1 + _max_retries)
+            _cost_per = float(cost_per_image)
+            _worst_per_image = _cost_per * (1 + _max_retries)
         else:
-            _primary_cost = photos_cfg.cost_for(_models[0])
+            _cost_per = photos_cfg.cost_for(_models[0])
             _worst_per_image = photos_cfg.worst_case_cost_per_image(_models, _max_retries)
-        _cost_per = _primary_cost  # used by build_plan for the per-row cost column
         photos_subdir = cfg.paths.product_photos
 
         # Read the sheet + build plans (used by both dry-run and execute).
@@ -1252,6 +1246,9 @@ def generate(
                 cost_per_image_usd=_cost_per,
                 part_col=cfg.csv.part_column,
                 size_col=cfg.csv.size_column,
+                # Push --sku into build_plan so we don't waste hundreds of Drive
+                # calls on SKUs we're going to filter out anyway.
+                sku_filter=sku_filter_norm,
             )
             progress.update(t, description=f"Built plan: {len(plans)} entries")
             progress.stop_task(t)
@@ -1276,21 +1273,17 @@ def generate(
                 progress.stop_task(t)
 
             console.print()
-            # Cost ranges: best case = 1 attempt per image; worst case = 1 + max_retries.
             best_case = counts['total_cost_usd']
-            # Per-model worst-case (cycles through models on retry — Gemini and
-            # GPT may have different costs).
             worst_case = round(counts['total_images'] * _worst_per_image, 4)
-            verify_note = (
-                f", verifier={photos_cfg.verify_model}, retries up to {_max_retries}"
-                if _verify_enabled else ", verifier OFF"
-            )
+            _models_label = " → ".join(_models)
             console.print(
                 f"[bold]Dry run complete[/bold] — "
                 f"{counts['to_copy']} SKUs to copy ({counts['copy_images']} images, $0), "
                 f"{counts['to_generate']} SKUs to generate "
-                f"({counts['total_images']} images, ~${best_case:.2f} best case "
-                f"/ ~${worst_case:.2f} worst case{verify_note}), "
+                f"({counts['total_images']} images, ~${best_case:.2f} best / "
+                f"~${worst_case:.2f} worst, models={_models_label}, "
+                f"verify={'on' if _verify_enabled else 'off'}, "
+                f"retries={_max_retries}), "
                 f"{counts['skipped']} skipped."
             )
             console.print(
@@ -1350,13 +1343,12 @@ def generate(
             )
             raise typer.Exit(1)
 
-        verify_status = "ON" if _verify_enabled else "OFF"
         console.print(
             f"[bold]Running[/bold] {runnable_copy_count} COPYs ({runnable_copy_images} files) + "
             f"{runnable_gen_count} GENERATEs ({runnable_gen_images} images, "
             f"~${runnable_best_cost:.2f}–${runnable_worst_cost:.2f}, "
-            f"models={_models}, quality={_quality}, "
-            f"verify={verify_status}, retries={_max_retries})."
+            f"models={' → '.join(_models)}, "
+            f"verify={'on' if _verify_enabled else 'off'}, retries={_max_retries})."
         )
 
         # Stage emits its own per-step logs via `logger=console.print`. We don't

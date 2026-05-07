@@ -85,7 +85,7 @@ def list_folders(parent_id: str) -> dict[str, str]:
                 pageSize=1000,
                 **_SD,
             )
-            .execute()
+            .execute(num_retries=4)
         )
         for f in resp.get("files", []):
             result[f["name"]] = f["id"]
@@ -215,7 +215,11 @@ def list_children(folder_id: str) -> list[dict[str, str]]:
 
 
 def list_files(folder_id: str) -> list[dict[str, str]]:
-    """Return [{id, name}, ...] for all non-folder, non-trashed files in folder_id."""
+    """Return [{id, name}, ...] for all non-folder, non-trashed files in folder_id.
+
+    Uses googleapiclient's `num_retries` so transient timeouts / SSL hiccups
+    are auto-retried with exponential backoff instead of killing the whole run.
+    """
     svc = _service()
     result: list[dict[str, str]] = []
     page_token: str | None = None
@@ -230,7 +234,7 @@ def list_files(folder_id: str) -> list[dict[str, str]]:
                 pageSize=1000,
                 **_SD,
             )
-            .execute()
+            .execute(num_retries=4)
         )
         result.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")

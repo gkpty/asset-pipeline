@@ -254,10 +254,12 @@ class PipelineConfig:
         material_columns_override = photos_raw.get("material_columns")
         model_costs_override = photos_raw.get("model_costs")
         # _build strips unknown keys; pull dict-valued sections into the
-        # dataclass manually below.
+        # dataclass manually below. `inpaint` is silently ignored if present
+        # in older configs (we removed the inpaint flow in favor of multi-image
+        # gpt-image / gemini edits).
         photos_section = {
             k: v for k, v in photos_raw.items()
-            if k not in ("material_columns", "model_costs")
+            if k not in ("material_columns", "model_costs", "inpaint")
         }
         # Back-compat: pre-multi-provider configs used `model = "..."`. Migrate
         # to a single-element `models = ["..."]` if the new key isn't set.

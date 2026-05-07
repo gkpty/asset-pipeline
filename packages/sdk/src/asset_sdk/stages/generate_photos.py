@@ -153,6 +153,7 @@ def build_plan(
     cost_per_image_usd: float,
     part_col: str = "",
     size_col: str = "",
+    sku_filter: str | None = None,
 ) -> list[PhotoPlan]:
     """One PhotoPlan per SKU in the sheet.
 
@@ -236,6 +237,12 @@ def build_plan(
         part = (row.get(part_col) or "").strip() if part_col else ""
         target_size = (row.get(size_col) or "").strip() if size_col else ""
         if not sku:
+            continue
+
+        # Early-skip when --sku is set: avoids expensive per-SKU Drive lookups
+        # for the 590+ SKUs we're not interested in. Sibling lookup for the
+        # filtered SKU still works because group_to_skus was built from all rows.
+        if sku_filter is not None and sku != sku_filter:
             continue
 
         target_materials = {col: (row.get(col) or "").strip() for col in material_columns}
@@ -450,50 +457,45 @@ def build_prompt(
     image_index_map: dict[str, int],
     image_type: str = "product",
 ) -> str:
-    """Minimal, declarative prompt — branched by source image type.
+    """Plain-language material-swap prompt for multi-image image-edit models.
 
-    `image_type` (from `_detect_and_crop`):
-      - "product": full product on a clean studio background. The model often
-        wants to add scenery / other furniture; we explicitly forbid that.
-      - "macro":   close-up detail (fabric weave, wood grain). The model often
-        wants to zoom out to a full product shot; we explicitly forbid that.
+    Mirrors the phrasing that consistently works in ChatGPT's web UI with
+    GPT-Image: name the old surface, point at the reference image for the new
+    material, then "leave everything else exactly the same and unchanged."
 
-    Same prompt every attempt; if a model fails, we just try the next model.
-    Claude's per-attempt retry feedback was contradictory across attempts,
-    so we no longer feed it back into the prompt.
+    `image_type` only switches the framing reminder; the swap instructions are
+    identical for product and macro shots.
     """
     pp = parent_product.strip() or "product"
-    if image_type == "macro":
-        lines: list[str] = [
-            f"This is a MACRO CLOSE-UP DETAIL photograph (a tight crop of a {pp}).",
-            "Reproduce image #1 EXACTLY: same tight crop, same framing, same depth-of-field, "
-            "same camera angle, same composition, same scale.",
-            "DO NOT zoom out. DO NOT show the full product. DO NOT add any furniture, "
-            "rooms, scenery, props, or additional objects. The output must be a close-up "
-            "detail shot, not a full product photo.",
-        ]
-    else:
-        lines = [
-            f"Photograph of a single {pp} on a clean white seamless studio background.",
-            "Reproduce image #1 EXACTLY: same product, same shape, same silhouette, same "
-            "proportions, same camera angle, same framing, same composition, same lighting.",
-            "DO NOT add other furniture, decor, rooms, walls, floors, or scenery. DO NOT "
-            "alter the product's shape, profile, or angle. The output must be the same "
-            "single product on a plain white background.",
-        ]
+    lines: list[str] = []
 
     if replacements:
-        lines.append("")
-        lines.append("Change ONLY the materials of these specific surfaces:")
-        for col, (_sibling_val, target_val) in replacements.items():
+        for col, (sibling_val, _target_val) in replacements.items():
             idx = image_index_map.get(col)
             label = col.replace("_", " ")
+            old = sibling_val.strip()
+            old_phrase = f"the {old} {label}" if old else f"the {label}"
             if idx:
-                lines.append(f"- {label}: use the material shown in image #{idx}")
+                lines.append(
+                    f"Replace {old_phrase} in photo 1 with the material shown in photo {idx}."
+                )
             else:
-                lines.append(f"- {label}: use {target_val}")
-        lines.append("")
-        lines.append("Every other pixel should match image #1 as closely as possible.")
+                lines.append(f"Replace {old_phrase} in photo 1.")
+
+    lines.append("Leave everything else in photo 1 exactly the same and unchanged.")
+    lines.append(
+        f"Keep the same {pp}, same shape, same camera angle, same framing, "
+        "same lighting, same background."
+    )
+    if image_type == "macro":
+        lines.append(
+            "This is a close-up detail shot; keep the same tight crop and depth of field."
+        )
+    lines.append(
+        "Do not add any text, watermarks, logos, brand names, signatures, "
+        "labels, tags, or stickers anywhere in the image."
+    )
+    lines.append("Output a high-resolution photograph.")
     return "\n".join(lines)
 
 
@@ -513,6 +515,12 @@ class GenProgress(NamedTuple):
 
 def _download(file_id: str, dest_path: str) -> None:
     drive.download_file(file_id, dest_path)
+
+
+def _save_jpeg(image_bytes: bytes, out_path: str) -> None:
+    """Normalize generated bytes (PNG/WEBP/JPEG) to a JPEG on disk."""
+    with _PILImage.open(io.BytesIO(image_bytes)) as img:
+        img.convert("RGB").save(out_path, "JPEG", quality=92, optimize=True)
 
 
 def _openai_client():
@@ -593,7 +601,6 @@ class Verdict:
     shape_match: bool = True
     angle_match: bool = True
     materials_correct: bool = True
-    bleed_through: list[str] = field(default_factory=list)
     quality_issues: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     retry_instructions: str = ""
@@ -609,6 +616,23 @@ def _anthropic_client():
             "ANTHROPIC_API_KEY is not set. Add it to .env or pass --no-verify."
         )
     return Anthropic(api_key=api_key)
+
+
+def _classify_image_type(local_path: str) -> str:
+    """Classify a source image as 'product' or 'macro' WITHOUT cropping it.
+
+    For inpainting we want the original (uncropped) source — cropping would
+    change dimensions and invalidate any masks built against the original
+    pixel grid. This is the same near-white heuristic as `_detect_and_crop`,
+    minus the side-effect of writing a cropped file.
+    """
+    try:
+        with _PILImage.open(local_path) as img:
+            arr = np.array(img.convert("RGB"))
+    except Exception:
+        return "product"
+    near_white = np.all(arr >= _NEAR_WHITE_THRESHOLD, axis=-1).mean()
+    return "macro" if float(near_white) < _PRODUCT_WHITE_PCT else "product"
 
 
 def _detect_and_crop(local_path: str) -> tuple[str, str]:
@@ -715,14 +739,19 @@ def _build_verifier_prompt(
 
     image_index_map: column → 1-based reference image position. The verifier
     expects images to be supplied in order: [original sibling, material refs..., generated].
+
+    The bar is intentionally loose: we fail only on drastic deviations
+    (shape changed, angle changed, missing/extra parts, bad warping, OR the
+    swap clearly didn't happen). Minor weave/color/lighting differences are
+    acceptable — image-edit models trade a little fidelity for a coherent
+    composite, and chasing pixel-perfect texture causes infinite retries.
     """
-    # Describe the labelled images.
     pp = parent_product.strip() or "product"
     lines: list[str] = [
-        f"You are a visual QA reviewer for AI-generated {pp} photography.",
+        f"You are a visual QA reviewer for AI-edited {pp} photography.",
         "",
         "Reference images supplied in order:",
-        "  Image 1: ORIGINAL — the source product photo. The generated image MUST match this exactly in product shape, proportions, camera angle, framing, lighting, and styling.",
+        "  Image 1: ORIGINAL — the source product photo.",
     ]
     for col, (sibling_val, target_val) in replacements.items():
         idx = image_index_map.get(col)
@@ -735,27 +764,49 @@ def _build_verifier_prompt(
     lines.extend([
         f"  Image {final_idx}: GENERATED — the AI-edited result you are reviewing.",
         "",
-        "Check the GENERATED image against the references:",
-        "  1. Shape — same product silhouette, proportions, structural design as Image 1?",
-        "  2. Angle/framing — same camera angle, crop, and composition as Image 1?",
-        "  3. Materials — does each visible surface match the corresponding target material reference (correct color, texture, weave, finish)?",
-        "  4. Bleed-through — ZERO patterns/colors/textures from the original's old materials carried over into the new ones (e.g. ghost grid, color leakage, residual print)?",
-        "  5. Quality — any warping, distortion, weird AI artifacts, broken edges, or hallucinated details?",
+        "Be LENIENT. The goal is a usable product photo of the SAME furniture",
+        "with new materials roughly applied — not a pixel-perfect re-render.",
+        "Approve marginal cases. Only reject for the failure modes below.",
+        "",
+        "Reject (ok=false) ONLY if you see one of these:",
+        f"  1. Shape changed — the {pp} in the generated image is a clearly",
+        "     different shape, silhouette, or structural design than Image 1",
+        "     (different style of furniture, missing major parts, extra parts",
+        "     that aren't in Image 1, drastically different proportions).",
+        "  2. Camera angle / framing changed drastically — the generated",
+        "     image is shot from a clearly different angle, viewpoint, or",
+        "     zoom level than Image 1.",
+        "  3. Severe AI artifacts — heavy warping, broken edges, melted",
+        "     surfaces, hallucinated objects, distorted geometry that would",
+        "     be obvious to a customer.",
+        "  4. Swap didn't happen — the surface that was supposed to change",
+        "     still clearly shows the original's material (same color AND",
+        "     same pattern as Image 1's old material on that surface). A",
+        "     partial / approximate swap is fine; only fail on no-op swaps.",
+        "  5. Hallucinated text — any text, letters, words, watermarks,",
+        "     logos, brand names, signatures, labels, tags, or stickers",
+        "     appear anywhere in the generated image (on the product, the",
+        "     background, or as overlays). Image 1 has none of these and",
+        "     the output must not either.",
+        "",
+        "Do NOT reject for any of these (these are acceptable):",
+        "  - Subtle color shifts, slight tonal differences from the reference.",
+        "  - Weave / grain texture not perfectly matching the reference.",
+        "  - Minor lighting or shadow differences vs the original.",
+        "  - Faint pattern residue from the original (as long as the",
+        "    dominant color/material clearly changed to the new one).",
+        "  - Minor crop or framing shifts.",
         "",
         "Reply with ONLY a JSON object (no prose, no markdown fences). Keys:",
-        "  ok                  — bool, true if the image is acceptable for production use",
-        "  shape_match         — bool",
-        "  angle_match         — bool",
-        "  materials_correct   — bool",
-        "  bleed_through       — list of strings naming any leftover features from the original materials",
-        "  quality_issues      — list of strings naming visual artifacts or distortions",
+        "  ok                  — bool, true if acceptable for production use",
+        "  shape_match         — bool, false only on drastic shape change",
+        "  angle_match         — bool, false only on drastic angle change",
+        "  materials_correct   — bool, false only when a swap didn't happen",
+        "  quality_issues      — list of strings naming severe artifacts (empty if minor or none)",
         "  reasons             — list of strings explaining WHY ok is false (empty if ok)",
-        "  retry_instructions  — string with concrete, specific instructions for the next regeneration "
-        "    attempt (e.g. \"the seat cushion still shows a faint windowpane grid; the new fabric must "
-        "    be solid cream linen with no horizontal or vertical lines anywhere\"). "
-        "    Keep this empty when ok is true.",
-        "",
-        "Be strict. Marginal failures should be marked ok=false so they get regenerated.",
+        "  retry_instructions  — string with one short, concrete instruction for the next attempt "
+        "    if ok is false (e.g. \"the chaise shape changed — the back cushion is now reclined; "
+        "    keep the original upright back\"). Empty when ok is true.",
     ])
     return "\n".join(lines)
 
@@ -805,7 +856,6 @@ def _parse_verdict(text: str) -> Verdict:
         shape_match=_bool("shape_match"),
         angle_match=_bool("angle_match"),
         materials_correct=_bool("materials_correct"),
-        bleed_through=_list("bleed_through"),
         quality_issues=_list("quality_issues"),
         reasons=_list("reasons"),
         retry_instructions=str(data.get("retry_instructions") or ""),
@@ -994,8 +1044,8 @@ def execute(
     photos_subdir: str,
     material_columns: dict[str, str],
     models: list[str],
-    quality: str,
-    size: str,
+    quality: str = "high",
+    size: str = "auto",
     verify_enabled: bool = True,
     verify_model: str = "claude-sonnet-4-6",
     max_retries: int = 2,
@@ -1007,24 +1057,19 @@ def execute(
       - COPY: duplicates each sibling photo into the target's photos folder
         verbatim (no AI call, $0 cost). Used when the sibling has identical
         materials — common case is a different size of the same product.
-      - GENERATE: AI-edits each sibling photo with material reference images.
+      - GENERATE: calls a multimodal image-edit model (gpt-image / gemini)
+        with [sibling_photo, *material_refs] + a plain-language swap prompt.
         Models cycle through `models` on retry: attempt 1 → models[0]; retry 1
         → models[1]; retry 2 → models[0] (wraps). Provider is detected from
         the model name prefix (gpt-* → OpenAI, gemini-* → Google).
         When `verify_enabled`, each output is reviewed by Claude (`verify_model`).
-        On failure, the prompt is augmented with the verifier's retry_instructions
-        and re-called with the next model in the cycle. Once shot 1 passes,
-        its output is added as a "materials anchor" reference for shots 2..N.
+        Retries fire only on drastic failures (shape change, angle change,
+        broken AI artifacts, no-op swap) — see `_build_verifier_prompt`.
 
-    SKIP plans are ignored. Provider clients (OpenAI, Gemini, Anthropic) are
-    initialized lazily, so a run with only COPY plans needs no API keys.
+    SKIP plans are ignored. OpenAI / Gemini / Anthropic clients are
+    lazy-constructed only when needed, so COPY-only runs need no API keys.
     """
-    if not models:
-        raise RuntimeError("execute(): models must be a non-empty list")
-
     sku_index = _build_sku_index(category_folder_id, structure)
-    clients: dict = {}              # provider name → client (lazy)
-    verify_client = None            # lazy: created on first verification
 
     for plan in plans:
         if plan.action not in ("COPY", "GENERATE"):
@@ -1097,13 +1142,22 @@ def execute(
                     )
             continue
 
-        # ----- GENERATE branch: AI-edit sibling photos with material refs. -----
-        # Provider clients are created lazily by _generate_dispatch as each
-        # provider is hit (cycle through `models` on retry).
+        # ----- GENERATE branch: multi-image edit via gpt-image / gemini. -----
+        # Each shot is one call to images.edit (or Gemini's equivalent) with
+        # [sibling_photo, *material_refs] + a plain-language swap prompt.
+        # Optional Claude-vision verifier gates the result; on rejection we
+        # cycle to the next model and retry.
+        if not models:
+            yield GenProgress(
+                sku=plan.sku, source_sku=plan.source_sku, file_index=0,
+                file_total=plan.photo_count, output_name="",
+                skipped=False,
+                error="no models configured (set generate.photos.models in pipeline.config.toml)",
+            )
+            continue
 
-        # Resolve + download material reference photos once per SKU. Order is
-        # deterministic (alphabetical column name) so prompt indices are stable.
-        with tempfile.TemporaryDirectory(prefix=f"genphotos_{plan.sku}_") as tmp:
+        # Resolve + download material reference photos once per SKU.
+        with tempfile.TemporaryDirectory(prefix=f"genphoto_{plan.sku}_") as tmp:
             tmp_path = _Path(tmp)
             material_paths_by_col: dict[str, str] = {}
             material_resolution_error: str | None = None
@@ -1137,20 +1191,29 @@ def execute(
                 )
                 continue
 
-            # image_index_map: column → 1-based reference image index. Image #1 is the
-            # sibling, the next N are the materials in alphabetical column order.
-            # When the materials anchor (a previously-approved generated photo)
-            # is added, it gets the slot right after the materials.
-            ordered_cols = list(material_paths_by_col.keys())
-            base_image_index_map = {col: 2 + i for i, col in enumerate(ordered_cols)}
+            # Drop columns where the material reference couldn't be resolved.
+            # The prompt and image-index map below must agree on what's actually
+            # being passed to the model.
+            effective_replacements = {
+                col: plan.replacements[col]
+                for col in plan.replacements
+                if col in material_paths_by_col
+            }
+            ordered_cols = sorted(material_paths_by_col.keys())
+            image_index_map = {col: 2 + i for i, col in enumerate(ordered_cols)}
             material_paths = [material_paths_by_col[c] for c in ordered_cols]
 
-            anchor_path: str | None = None  # set after shot 1 passes verification
+            # Provider clients lazily constructed and shared across all shots.
+            clients: dict = {}
+            cl_client = None  # Anthropic — created on first verifier call.
 
             for i, sib in enumerate(sibling_photos, 1):
-                # Output name mirrors sibling's index; .jpg extension.
                 out_name = f"{i}.jpg"
-                if out_name in existing_names:
+                if out_name in existing_names and not debug:
+                    logger(
+                        f"\n[shot {i}/{len(sibling_photos)}] {plan.sku} → {out_name}  "
+                        f"[SKIPPED — file already exists; pass --debug to overwrite]"
+                    )
                     yield GenProgress(
                         sku=plan.sku, source_sku=plan.source_sku, file_index=i,
                         file_total=len(sibling_photos), output_name=out_name,
@@ -1158,10 +1221,15 @@ def execute(
                     )
                     continue
 
-                sib_raw_local = str(tmp_path / f"sibling_{sib['name']}")
+                logger(f"\n[shot {i}/{len(sibling_photos)}] {plan.sku} → {out_name}")
+                logger(f"  source: {sib['name']}")
+                logger(f"  replacements: {dict(effective_replacements)}")
+
+                sib_local = str(tmp_path / f"sibling_{sib['name']}")
                 try:
-                    _download(sib["id"], sib_raw_local)
+                    _download(sib["id"], sib_local)
                 except Exception as exc:
+                    logger(f"  ✗ could not download sibling photo: {exc}")
                     yield GenProgress(
                         sku=plan.sku, source_sku=plan.source_sku, file_index=i,
                         file_total=len(sibling_photos), output_name=out_name,
@@ -1169,183 +1237,191 @@ def execute(
                     )
                     continue
 
-                # Auto-crop white background (product silhouettes only) and
-                # detect image type (product vs macro). Cropping gives the
-                # model a much stronger product-shape signal; the type drives
-                # the prompt branch so macro shots aren't hallucinated into
-                # full-product scenes.
-                sib_local, image_type = _detect_and_crop(sib_raw_local)
-                logger(f"  source type: {image_type}" + (
-                    " (auto-cropped)" if sib_local != sib_raw_local else ""
-                ))
+                shot_debug_dir: str | None = None
+                if debug:
+                    shot_debug_dir = str(tmp_path / f"_debug_shot{i}")
+                    os.makedirs(shot_debug_dir, exist_ok=True)
 
-                # Compose the model input: sibling + materials, plus the
-                # anchor (clean shot 1 output) if available.
-                gen_image_paths = [sib_local]
-                gen_index_map = dict(base_image_index_map)
-                if anchor_path:
-                    # Anchor (a previously-approved output) goes in slot #2.
-                    gen_image_paths.insert(1, anchor_path)
-                    gen_index_map = {col: idx + 1 for col, idx in base_image_index_map.items()}
-                gen_image_paths.extend(material_paths)
+                shot_image_type = _classify_image_type(sib_local)
+                logger(f"  image_type: {shot_image_type}")
+
+                # Skip macros: image-edit models tend to zoom out to a full
+                # product shot. The user shoots these manually.
+                if shot_image_type == "macro":
+                    logger("  [skip] macro shots are not auto-generated — manual photography required")
+                    yield GenProgress(
+                        sku=plan.sku, source_sku=plan.source_sku, file_index=i,
+                        file_total=len(sibling_photos), output_name=out_name,
+                        skipped=True,
+                        error="macro shot — skipped, take photo manually",
+                    )
+                    continue
 
                 prompt = build_prompt(
-                    plan.parent_product, plan.replacements, gen_index_map,
-                    image_type=image_type,
+                    plan.parent_product,
+                    effective_replacements,
+                    image_index_map,
+                    image_type=shot_image_type,
                 )
-                verdict: Verdict | None = None
-                attempt = 0
-                upload_done = False
-                last_provider_error: str = ""
-                failed_dest_id: str | None = None  # lazy: only created when --debug uploads happen
-
-                # Header for this shot, with the prompt printed once.
-                logger(f"\n[shot {i}/{len(sibling_photos)}] {plan.sku} → {out_name}")
-                logger("  Prompt:")
+                logger("  prompt:")
                 for line in prompt.splitlines():
                     logger(f"    {line}")
+                if shot_debug_dir:
+                    _Path(shot_debug_dir, "00_prompt.txt").write_text(prompt)
+                    _Path(shot_debug_dir, "00_source.jpg").write_bytes(_Path(sib_local).read_bytes())
+                    for col, mp in material_paths_by_col.items():
+                        idx = image_index_map[col]
+                        ext = os.path.splitext(mp)[1] or ".jpg"
+                        _Path(shot_debug_dir, f"00_material_{idx}_{col}{ext}").write_bytes(_Path(mp).read_bytes())
 
+                attempt = 0
+                last_error = ""
+                result_path = ""
+                upload_done = False
                 while True:
                     attempt += 1
-                    # Cycle through models on each attempt (wraps when retries > len(models)).
-                    current_model = models[(attempt - 1) % len(models)]
+                    model = models[(attempt - 1) % len(models)]
+                    shot_start = time.time()
                     try:
-                        provider_label = _provider_for(current_model)
-                    except Exception:
-                        provider_label = "?"
-
-                    logger(f"  → attempt {attempt} ({provider_label}/{current_model})")
-                    logger(f"    ⏳ generating…")
-                    gen_start = time.time()
-                    try:
-                        image_bytes = _generate_dispatch(
+                        logger(f"  attempt {attempt}: model={model}")
+                        img_bytes = _generate_dispatch(
                             clients=clients,
-                            model=current_model,
+                            model=model,
                             quality=quality,
                             size=size,
-                            sibling_photo_path=gen_image_paths[0],
-                            material_paths=gen_image_paths[1:],
+                            sibling_photo_path=sib_local,
+                            material_paths=material_paths,
                             prompt=prompt,
                         )
+                        elapsed = time.time() - shot_start
+                        result_path = str(tmp_path / f"shot{i}_attempt{attempt}.jpg")
+                        _save_jpeg(img_bytes, result_path)
+                        logger(f"  ✓ generated in {elapsed:.1f}s")
+                        if shot_debug_dir:
+                            _Path(shot_debug_dir, f"01_attempt{attempt}_{model.replace('/', '_')}.jpg").write_bytes(
+                                _Path(result_path).read_bytes()
+                            )
                     except Exception as exc:
-                        gen_elapsed = time.time() - gen_start
-                        last_provider_error = f"{provider_label} ({current_model}) error: {exc}"
-                        logger(f"    ✗ generation failed in {gen_elapsed:.1f}s: {exc}")
+                        last_error = str(exc)
+                        elapsed = time.time() - shot_start
+                        logger(f"  ✗ attempt {attempt} failed in {elapsed:.1f}s: {exc}")
                         if attempt > max_retries:
                             yield GenProgress(
                                 sku=plan.sku, source_sku=plan.source_sku, file_index=i,
                                 file_total=len(sibling_photos), output_name=out_name,
                                 skipped=False,
-                                error=f"all {attempt} attempts failed; last error: {last_provider_error}",
+                                error=f"all {attempt} attempts failed; last error: {last_error}",
                             )
                             break
                         continue
 
-                    gen_elapsed = time.time() - gen_start
-                    logger(f"    ✓ generated {len(image_bytes):,} bytes in {gen_elapsed:.1f}s")
-
-                    # Normalize to real JPEG. gpt-image-* sometimes returns PNG; without
-                    # this the verifier rejects on a MIME mismatch.
-                    candidate_path = str(
-                        tmp_path / f"shot_{i}_attempt_{attempt}_{provider_label}.jpg"
-                    )
-                    try:
-                        with _PILImage.open(io.BytesIO(image_bytes)) as raw_out:
-                            raw_out.convert("RGB").save(
-                                candidate_path, format="JPEG", quality=92, optimize=True,
-                            )
-                    except Exception:
-                        with open(candidate_path, "wb") as fh:
-                            fh.write(image_bytes)
-
-                    if not verify_enabled:
-                        verdict = Verdict(ok=True)
-                        logger("    (verifier off — accepting)")
-                    else:
-                        if verify_client is None:
-                            try:
-                                verify_client = _anthropic_client()
-                            except Exception as exc:
-                                logger(f"    ✗ verifier unavailable: {exc}")
-                                yield GenProgress(
-                                    sku=plan.sku, source_sku=plan.source_sku, file_index=i,
-                                    file_total=len(sibling_photos), output_name=out_name,
-                                    skipped=False,
-                                    error=f"verifier unavailable: {exc} (use --no-verify to skip)",
-                                )
-                                break
-                        logger(f"    ⏳ verifying with {verify_model}…")
-                        verify_start = time.time()
+                    if verify_enabled:
+                        if cl_client is None:
+                            cl_client = _anthropic_client()
+                        logger(f"  verifying with {verify_model}…")
                         verdict = verify_with_claude(
-                            client=verify_client,
+                            client=cl_client,
                             model=verify_model,
                             parent_product=plan.parent_product,
                             sibling_photo_path=sib_local,
-                            generated_photo_path=candidate_path,
+                            generated_photo_path=result_path,
                             material_paths_by_col=material_paths_by_col,
-                            replacements=plan.replacements,
+                            replacements=effective_replacements,
                         )
-                        verify_elapsed = time.time() - verify_start
-                        if verdict.ok:
-                            logger(f"    ✓ verifier passed in {verify_elapsed:.1f}s")
-                        else:
-                            reason = "; ".join(verdict.reasons) or verdict.retry_instructions or "rejected"
-                            logger(f"    ✗ verifier rejected in {verify_elapsed:.1f}s: {reason}")
-
-                    if verdict.ok or attempt > max_retries:
-                        # Accept or give up: upload either way.
+                        if shot_debug_dir:
+                            _Path(shot_debug_dir, f"02_verdict_attempt{attempt}.json").write_text(
+                                json.dumps({
+                                    "ok": verdict.ok,
+                                    "shape_match": verdict.shape_match,
+                                    "angle_match": verdict.angle_match,
+                                    "materials_correct": verdict.materials_correct,
+                                    "quality_issues": verdict.quality_issues,
+                                    "reasons": verdict.reasons,
+                                    "retry_instructions": verdict.retry_instructions,
+                                    "raw_response": verdict.raw_response,
+                                }, indent=2)
+                            )
                         if not verdict.ok:
-                            logger(f"    (uploading anyway — {max_retries} retries exhausted)")
-                        try:
-                            drive.upload_file(candidate_path, target_photos_id, out_name, "image/jpeg")
-                            upload_done = True
-                            logger(f"    ✓ uploaded → {out_name}")
-                        except Exception as exc:
-                            logger(f"    ✗ upload failed: {exc}")
-                            yield GenProgress(
-                                sku=plan.sku, source_sku=plan.source_sku, file_index=i,
-                                file_total=len(sibling_photos), output_name=out_name,
-                                skipped=False, error=f"upload failed: {exc}",
-                            )
-                            break
-                        break
+                            logger(f"  ✗ verifier rejected: {'; '.join(verdict.reasons) or 'no reason given'}")
+                            if verdict.retry_instructions:
+                                logger(f"    retry: {verdict.retry_instructions}")
+                            if attempt > max_retries:
+                                logger("  ! using latest attempt anyway (max retries hit)")
+                                # Fall through to upload.
+                            else:
+                                continue
+                        else:
+                            logger("  ✓ verifier passed")
 
-                    # Verifier rejected and we have retries left. Optionally archive
-                    # the failed candidate to <photos>/failed_generations/ for review.
-                    if debug:
-                        try:
-                            if failed_dest_id is None:
-                                failed_dest_id = drive.find_or_create_folder(
-                                    "failed_generations", target_photos_id,
+                    # Upload (succeeded or accepted-after-max-retries).
+                    try:
+                        if debug and out_name in existing_names:
+                            try:
+                                for f in drive.list_files(target_photos_id):
+                                    if f["name"] == out_name:
+                                        drive.trash_item(f["id"])
+                                        logger(f"  [debug] trashed existing {out_name}")
+                                        break
+                            except Exception:
+                                pass
+                        drive.upload_file(
+                            result_path, target_photos_id, out_name, "image/jpeg",
+                        )
+                        upload_done = True
+                        logger(f"  ✓ uploaded → {out_name}")
+                    except Exception as exc:
+                        logger(f"  ✗ upload failed: {exc}")
+                        yield GenProgress(
+                            sku=plan.sku, source_sku=plan.source_sku, file_index=i,
+                            file_total=len(sibling_photos), output_name=out_name,
+                            skipped=False, error=f"upload failed: {exc}",
+                        )
+                        break
+                    break
+
+                # Upload the debug artifacts (regardless of success/failure)
+                # to Drive so the user can inspect what happened.
+                if debug and shot_debug_dir and os.path.isdir(shot_debug_dir):
+                    try:
+                        debug_root = drive.find_or_create_folder(
+                            "_debug", target_photos_id,
+                        )
+                        shot_folder = drive.find_or_create_folder(
+                            f"shot{i}", debug_root,
+                        )
+                        # Sub-folders + files. Walk the local debug dir and
+                        # mirror its structure on Drive.
+                        for root, _dirs, files in os.walk(shot_debug_dir):
+                            rel_root = os.path.relpath(root, shot_debug_dir)
+                            if rel_root == ".":
+                                parent_id = shot_folder
+                            else:
+                                parent_id = shot_folder
+                                for part in rel_root.split(os.sep):
+                                    parent_id = drive.find_or_create_folder(part, parent_id)
+                            for fname in files:
+                                local = os.path.join(root, fname)
+                                ext = os.path.splitext(fname)[1].lower()
+                                mime = (
+                                    "image/jpeg" if ext in (".jpg", ".jpeg")
+                                    else "image/png" if ext == ".png"
+                                    else "application/json" if ext == ".json"
+                                    else "text/plain"
                                 )
-                            failed_name = (
-                                f"shot{i}_attempt{attempt}_{provider_label}_{current_model}.jpg"
-                            )
-                            drive.upload_file(
-                                candidate_path, failed_dest_id, failed_name, "image/jpeg",
-                            )
-                            logger(f"    [debug] saved failed attempt → failed_generations/{failed_name}")
-                        except Exception as exc:
-                            logger(f"    [debug] could not archive failed attempt: {exc}")
-                    # Loop back to retry with next model in the cycle (same prompt).
+                                try:
+                                    drive.upload_file(local, parent_id, fname, mime)
+                                except Exception as exc:
+                                    logger(f"  [debug] upload failed for {fname}: {exc}")
+                        logger(f"  [debug] artifacts → _debug/shot{i}/")
+                    except Exception as exc:
+                        logger(f"  [debug] could not upload debug folder: {exc}")
 
                 if not upload_done:
-                    continue  # already yielded an error
+                    continue
 
                 existing_names.add(out_name)
-
-                # Save shot 1 as the materials anchor for subsequent shots.
-                if i == 1 and (verdict is None or verdict.ok):
-                    anchor_path = candidate_path
-
-                err_note = ""
-                if verdict and not verdict.ok and attempt > max_retries:
-                    err_note = f"uploaded after {max_retries} failed verifications: " + (
-                        "; ".join(verdict.reasons) or verdict.retry_instructions or "see logs"
-                    )
-
                 yield GenProgress(
                     sku=plan.sku, source_sku=plan.source_sku, file_index=i,
                     file_total=len(sibling_photos), output_name=out_name,
-                    skipped=False, error=err_note,
+                    skipped=False, error="",
                 )

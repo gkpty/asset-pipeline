@@ -196,6 +196,7 @@ dependencies = [
     { name = "python-barcode" },
     { name = "python-dotenv" },
     { name = "rembg" },
+    { name = "replicate" },
     { name = "reportlab" },
     { name = "trimesh" },
 ]
@@ -221,6 +222,7 @@ requires-dist = [
     { name = "python-barcode", specifier = ">=0.15" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "rembg", specifier = ">=2.0" },
+    { name = "replicate", specifier = ">=0.30" },
     { name = "reportlab", specifier = ">=4.0" },
     { name = "trimesh", specifier = ">=4.0" },
 ]
@@ -1796,6 +1798,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/21/1c/4d9a81d452d44d914e8ab3e964809ff2388f6919324f005513aa61e1c378/rembg-2.0.75.tar.gz", hash = "sha256:e2143fb5838c8b2238fa45d765ce18d0710801d5aef73f2c4ac9377991d1f526", size = 30148, upload-time = "2026-04-08T11:45:15.42Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/09/60b6d1e6b07520a133ec4522cf7c1a6d684301b64bc7a7b96aad6baa1e21/rembg-2.0.75-py3-none-any.whl", hash = "sha256:536cc7aec597e6e17d805992f9014e6082b5bef76b1b68034d746e0690af3a94", size = 45011, upload-time = "2026-04-08T11:45:16.533Z" },
+]
+
+[[package]]
+name = "replicate"
+version = "1.0.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "packaging" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4b/fd/caf6c59a6b8007366bd52ab5a320bf8d828f3860a60039309cfc0e375ec9/replicate-1.0.7.tar.gz", hash = "sha256:d88cb2c37ba39fb370c87fc3291601c67aae64bb918a20a85b5ce399c23ee84c", size = 62226, upload-time = "2025-05-27T11:29:08.111Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c2/5a/b3aa02a11a33de08e7771579154af3193decfb9d923b30b14c17b4e8bbce/replicate-1.0.7-py3-none-any.whl", hash = "sha256:667c50a9eb83be17de6278ff89483102b3b50f49a2c7fbcaa2e2b14df13816f9", size = 48626, upload-time = "2025-05-27T11:29:06.801Z" },
 ]
 
 [[package]]
