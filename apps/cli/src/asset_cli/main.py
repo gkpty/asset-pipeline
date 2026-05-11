@@ -419,7 +419,10 @@ def upload_local_files(
     ),
     supplier: Optional[str] = typer.Option(
         None, "--supplier",
-        help="Restrict SKU matching to one supplier (faster + fewer false positives).",
+        help="Restrict SKU matching to one supplier. Faster, fewer false positives, "
+             "AND relaxes fuzzy/token-coverage thresholds since cross-supplier "
+             "collisions are impossible — use this whenever your input directory "
+             "contains files from a single supplier.",
     ),
     config_path: Path = typer.Option(
         Path("pipeline.config.toml"),
@@ -450,10 +453,20 @@ def upload_local_files(
     ),
 ) -> None:
     """
-    Generic local-file uploader. Dry run scans the input directory, infers a destination
-    SKU per file (filename → supplier ref → product name → PDF content → fuzzy), and
-    writes a report to a sheet tab. Edit that tab as needed, then re-run with --execute
-    to upload each file to <category>/<supplier>/<sku>/<type subdir>/.
+    Generic local-file uploader. Dry run scans the input directory, infers a
+    destination SKU per file, and writes a report to a sheet tab. Edit that
+    tab as needed, then re-run with --execute to upload each file to
+    <category>/<supplier>/<sku>/<type subdir>/.
+
+    Matching searches the full relative path (parent folders + filename), so a
+    file like 'Bermuda White Linen/photos/IMG_001.jpg' matches on the parent
+    folder name. Match passes (in order, first hit wins):
+      1. HIGH   — path contains the SKU / supplier ref / product name verbatim
+      2. MEDIUM — path tokens overlap candidate's name/ref tokens (length-weighted)
+      3. MEDIUM — for PDFs, same checks against extracted PDF text
+      4. LOW    — fuzzy match (difflib SequenceMatcher) above cutoff
+
+    Pass --supplier to relax token/fuzzy cutoffs (no cross-supplier collisions).
     """
     from asset_sdk.adapters import drive
     from asset_sdk.adapters.sheets import read_rows, write_report
@@ -915,7 +928,8 @@ def generate(
         ..., "--type",
         help=("Asset type(s) to generate. Copy-from-siblings supports comma-separated "
               "values and the 'all' shortcut: e.g. 'diagram', 'diagram,models_dwg', "
-              "'all'. Render mode is barcode-only. Photos mode is photos-only."),
+              "'all'. Render mode is barcode-only. Photos mode is photos-only. "
+              "Video mode is video-only."),
     ),
     config_path: Path = typer.Option(
         Path("pipeline.config.toml"),
@@ -983,8 +997,36 @@ def generate(
     ),
     max_retries: Optional[int] = typer.Option(
         None, "--max-retries",
-        help="(--type photos --execute) Override generate.photos.max_retries (default: 2). "
-             "Each retry costs another generation + verification call.",
+        help="(--type photos / video --execute) Override the configured max_retries. "
+             "Each retry costs another generation call.",
+    ),
+    prompt: Optional[str] = typer.Option(
+        None, "--prompt",
+        help="(--type video) Extra motion / style guidance appended to the default "
+             "video prompt. Example: --prompt 'orbit slowly around the chair'.",
+    ),
+    add_background: bool = typer.Option(
+        False, "--add-background",
+        help="(--type video) Place the product in a scene instead of the white studio "
+             "background. Uses the configured default scene (see generate.video."
+             "default_background). Pair with --background to override the scene text. "
+             "Switches into Seedance 2.0+ reference-images mode.",
+    ),
+    background_text: Optional[str] = typer.Option(
+        None, "--background",
+        help="(--type video) Override the background scene description. Implies "
+             "--add-background. Example: --background 'sunlit Tokyo loft with oak floors'.",
+    ),
+    add_audio: bool = typer.Option(
+        False, "--add-audio",
+        help="(--type video) Generate background music for the video. Uses the "
+             "configured default style (see generate.video.default_audio — currently "
+             "'smooth jazz'). Pair with --audio to override. Requires Seedance 2.0+.",
+    ),
+    audio_text: Optional[str] = typer.Option(
+        None, "--audio",
+        help="(--type video) Override the audio style description. Implies --add-audio. "
+             "Example: --audio 'cinematic orchestral score'.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -1008,6 +1050,11 @@ def generate(
         material columns whose values differ, and call gpt-image-1 to produce
         N outputs (matching sibling's photo count). Cost is estimated in the
         dry-run report; --budget enforces a hard pre-flight ceiling on execute.
+
+      - video → for each SKU missing a video, pick its first white-bg photo
+        and call Replicate's image-to-video model (default seedance) to
+        produce one short promotional clip uploaded to <sku>/videos/<sku>.mp4.
+        --prompt adds extra motion / style guidance on top of the default.
 
     Dry run scans, builds a plan, writes a report tab. Edit that tab as needed
     (change Source SKU, set Action=SKIP, fix barcode strings, etc.) then re-run
@@ -1063,6 +1110,12 @@ def generate(
                 "--type photos cannot be combined with other types (different report shape)."
             )
         type_label = "Photos"
+    elif "video" in requested:
+        if len(requested) > 1:
+            raise typer.BadParameter(
+                "--type video cannot be combined with other types (different report shape)."
+            )
+        type_label = "Video"
     else:
         unsupported = [t for t in requested if t not in _COPY_FROM_SIBLINGS_KINDS]
         if unsupported:
@@ -1382,6 +1435,219 @@ def generate(
 
         console.print(
             f"\n[bold]Photo generation complete[/bold]  "
+            f"({generated} generated, {skipped} skipped, {errored} errored)"
+        )
+        return
+
+    # ------------------ VIDEO ------------------
+    if requested == ["video"]:
+        from asset_sdk.stages.generate_videos import (
+            build_plan as bp_video,
+            execute as run_video,
+            summarise as sum_video,
+            to_sheet_rows as rows_video,
+        )
+        video_cfg = cfg.generate.video
+        if models:
+            _models = [m.strip() for m in models.split(",") if m.strip()]
+        else:
+            _models = list(video_cfg.models)
+        if not _models:
+            raise typer.BadParameter(
+                "no models configured — set --models or generate.video.models in pipeline.config.toml"
+            )
+
+        _max_retries = max_retries if max_retries is not None else video_cfg.max_retries
+        if _max_retries < 0:
+            raise typer.BadParameter("--max-retries must be >= 0")
+
+        # Resolve --add-background / --background and --add-audio / --audio
+        # to the final strings sent to the model. Passing the text override
+        # implies the toggle.
+        _bg_on = bool(add_background) or bool(background_text)
+        _bg_text = (background_text or video_cfg.default_background).strip() if _bg_on else ""
+        _audio_on = bool(add_audio) or bool(audio_text)
+        _audio_text = (audio_text or video_cfg.default_audio).strip() if _audio_on else ""
+
+        # Both features need Seedance 2.0+. Fail fast before any Drive/Sheets work.
+        any_v2 = any(m.strip().lower().startswith("bytedance/seedance-2") for m in _models)
+        if (_bg_on or _audio_on) and not any_v2:
+            offenders = []
+            if _bg_on:
+                offenders.append("--add-background / --background")
+            if _audio_on:
+                offenders.append("--add-audio / --audio")
+            raise typer.BadParameter(
+                f"{', '.join(offenders)} require a Seedance 2.0+ model. "
+                f"Configured: {_models}. Set --models bytedance/seedance-2.0 or "
+                "update generate.video.models in pipeline.config.toml."
+            )
+
+        _cost_per = video_cfg.cost_for(_models[0])
+        _worst_per_video = video_cfg.worst_case_cost_per_video(_models, _max_retries)
+        photos_subdir = cfg.paths.product_photos
+        videos_subdir = cfg.paths.videos
+
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            t = progress.add_task(f"Reading '{_tab}' tab…", total=None)
+            sheet_rows = read_rows(sheet_id, _tab)
+            progress.update(t, description=f"Read {len(sheet_rows)} rows from '{_tab}'")
+            progress.stop_task(t)
+
+            t = progress.add_task(f"Scanning {category} drive for videos / photos…", total=None)
+            plans = bp_video(
+                category_folder_id=category_folder_id,
+                structure=structure,
+                sheet_rows=sheet_rows,
+                sku_col=cfg.csv.sku_column,
+                supplier_col=cfg.csv.supplier_column,
+                parent_product_col=cfg.csv.parent_product_column,
+                photos_subdir=photos_subdir,
+                videos_subdir=videos_subdir,
+                cost_per_video_usd=_cost_per,
+                default_background=_bg_text,
+                default_audio=_audio_text,
+                sku_filter=sku_filter_norm,
+            )
+            progress.update(t, description=f"Built plan: {len(plans)} entries")
+            progress.stop_task(t)
+
+        # Only --sku applies to video plans; --action has no meaning (one action).
+        if sku_filter_norm:
+            plans = [p for p in plans if p.sku == sku_filter_norm]
+            console.print(f"[dim]Filtered to {len(plans)} entries (sku={sku_filter_norm!r})[/dim]")
+
+        counts = sum_video(plans)
+
+        if not execute:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+                t = progress.add_task(f"Writing report to '{_report_tab}'…", total=None)
+                headers, rows = rows_video(plans)
+                write_report(sheet_id, _report_tab, headers, rows)
+                progress.update(t, description=f"Report written → '{_report_tab}'")
+                progress.stop_task(t)
+
+            console.print()
+            best_case = counts['total_cost_usd']
+            worst_case = round(counts['to_generate'] * _worst_per_video, 4)
+            _models_label = " → ".join(_models)
+            console.print(
+                f"[bold]Dry run complete[/bold] — "
+                f"{counts['to_generate']} videos to generate "
+                f"(~${best_case:.2f} best / ~${worst_case:.2f} worst, "
+                f"models={_models_label}, retries={_max_retries}, "
+                f"{video_cfg.duration_seconds}s @ {video_cfg.resolution}), "
+                f"{counts['skipped']} skipped."
+            )
+            console.print(
+                f"\nReview '{_report_tab}' (per-SKU edits override CLI defaults):"
+                f"\n  • Action=SKIP   → skip that row"
+                f"\n  • Source Photos → comma-separated filenames. Order matters:"
+                f"\n                    first = start frame, last = end frame (keyframe"
+                f"\n                    mode); up to {video_cfg.max_reference_images}"
+                f" used in reference mode. Leave"
+                f"\n                    untouched to use Drive's full set."
+                f"\n  • Background    → scene description. Non-empty switches that SKU"
+                f"\n                    into reference-images mode (Seedance 2.0+)."
+                f"\n  • Audio         → audio style. Non-empty enables Seedance 2.0+ music."
+                f"\nThen re-run with --execute (and --budget to set a hard cost cap)."
+            )
+            return
+
+        # ----- Execute -----
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
+            t = progress.add_task(f"Reading report '{_report_tab}'…", total=None)
+            report_rows = read_rows(sheet_id, _report_tab)
+            progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
+            progress.stop_task(t)
+
+        actionable_skus = {
+            (r.get("SKU") or "").strip()
+            for r in report_rows
+            if (r.get("Action") or "").strip().upper() == "GENERATE"
+        }
+        # Honor user edits to the report. For each SKU, the row's cells
+        # become authoritative:
+        #   - Source Photos: comma-separated filenames (curated reference set)
+        #   - Background:    scene description (non-empty → reference-images mode)
+        #   - Audio:         audio style (non-empty → generate background music)
+        # Cells are read unconditionally (even when empty) so users can clear
+        # the default to disable a feature on a specific row.
+        report_row_by_sku: dict[str, dict[str, str]] = {
+            (r.get("SKU") or "").strip(): r
+            for r in report_rows
+            if (r.get("SKU") or "").strip()
+        }
+        for p in plans:
+            r = report_row_by_sku.get(p.sku)
+            if r is None:
+                continue
+            raw_sp = (r.get("Source Photos") or "").strip()
+            if raw_sp:
+                names = [n.strip() for n in raw_sp.split(",") if n.strip()]
+                if names:
+                    p.source_photos = names
+            p.background = (r.get("Background") or "").strip()
+            p.audio = (r.get("Audio") or "").strip()
+        runnable = [p for p in plans if p.action == "GENERATE" and p.sku in actionable_skus]
+
+        runnable_worst_cost = round(len(runnable) * _worst_per_video, 4)
+        runnable_best_cost = round(sum(p.cost_usd for p in runnable), 4)
+
+        if not runnable:
+            console.print("[yellow]Nothing to do (no rows with Action=GENERATE matched).[/yellow]")
+            return
+
+        if budget is not None and runnable_worst_cost > float(budget):
+            console.print(
+                f"[red]Aborted:[/red] worst-case AI cost "
+                f"${runnable_worst_cost:.2f} (best ${runnable_best_cost:.2f}) "
+                f"exceeds --budget ${float(budget):.2f}. "
+                f"({len(runnable)} videos, max {_max_retries} retries each.)"
+            )
+            console.print("Set Action=SKIP on rows you don't want, lower --max-retries, or raise --budget.")
+            raise typer.Exit(1)
+
+        with_bg = sum(1 for p in runnable if p.background.strip())
+        with_audio = sum(1 for p in runnable if p.audio.strip())
+        console.print(
+            f"[bold]Running[/bold] {len(runnable)} video generations "
+            f"(~${runnable_best_cost:.2f}–${runnable_worst_cost:.2f}, "
+            f"models={' → '.join(_models)}, retries={_max_retries}, "
+            f"{video_cfg.duration_seconds}s @ {video_cfg.resolution}, "
+            f"bg-rows={with_bg}/{len(runnable)}, audio-rows={with_audio}/{len(runnable)})."
+        )
+
+        generated = errored = skipped = 0
+        for prog in run_video(
+            plans=runnable,
+            category_folder_id=category_folder_id,
+            structure=structure,
+            photos_subdir=photos_subdir,
+            videos_subdir=videos_subdir,
+            models=_models,
+            duration=video_cfg.duration_seconds,
+            resolution=video_cfg.resolution,
+            aspect_ratio=video_cfg.aspect_ratio,
+            default_prompt=video_cfg.default_prompt,
+            extra_prompt=(prompt or ""),
+            camera_fixed=video_cfg.camera_fixed,
+            use_last_frame=video_cfg.use_last_frame,
+            max_reference_images=video_cfg.max_reference_images,
+            max_retries=_max_retries,
+            debug=debug,
+            logger=console.print,
+        ):
+            if prog.error:
+                if prog.skipped:
+                    skipped += 1
+                else:
+                    errored += 1
+            else:
+                generated += 1
+
+        console.print(
+            f"\n[bold]Video generation complete[/bold]  "
             f"({generated} generated, {skipped} skipped, {errored} errored)"
         )
         return

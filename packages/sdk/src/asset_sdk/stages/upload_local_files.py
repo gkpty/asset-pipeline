@@ -36,9 +36,16 @@ _TYPE_ALIASES: dict[str, str] = {
 }
 
 # Tunable thresholds for the matcher.
-_FUZZY_CUTOFF = 0.72        # for difflib SequenceMatcher.ratio() against single-string fields
-_TOKEN_COVERAGE_CUTOFF = 0.7  # fraction of candidate-name tokens that must appear in filename
-_MIN_TOKEN_LEN = 3            # ignore tokens shorter than this
+#
+# The "supplier" variants kick in when --supplier narrows the candidate pool
+# to a single supplier. In that mode the risk of cross-supplier collisions
+# disappears (e.g. two suppliers both selling something called "linen"),
+# so we can match on weaker evidence without producing nonsense.
+_FUZZY_CUTOFF = 0.72                 # difflib SequenceMatcher.ratio() against a normalised field
+_FUZZY_CUTOFF_SUPPLIER = 0.55
+_TOKEN_COVERAGE_CUTOFF = 0.7         # weighted-token-overlap fraction
+_TOKEN_COVERAGE_CUTOFF_SUPPLIER = 0.45
+_MIN_TOKEN_LEN = 3                   # ignore tokens shorter than this
 
 
 def resolve_type_subdir(asset_type: str, paths: InputPaths) -> str:
@@ -89,6 +96,24 @@ def _walk_files(input_dir: Path) -> Iterable[Path]:
     for p in input_dir.rglob("*"):
         if p.is_file() and not p.name.startswith("."):
             yield p
+
+
+def _haystack(path: Path, input_dir: Path) -> tuple[str, set[str]]:
+    """Build the searchable string + token set for a file.
+
+    Includes the relative directory chain so files like
+    `Bermuda White Linen/photos/IMG_001.jpg` get matched on the parent
+    folder name (which is usually the product name) rather than on the
+    meaningless `IMG_001` stem. Falls back to just the stem if `path` is
+    outside `input_dir`.
+    """
+    try:
+        rel = path.relative_to(input_dir)
+        parts = list(rel.parts[:-1]) + [path.stem]
+    except ValueError:
+        parts = [path.stem]
+    raw = " ".join(parts)
+    return _normalise(raw), _tokens(raw)
 
 
 def _read_pdf_text(path: Path) -> str:
@@ -167,23 +192,38 @@ def _best_token_coverage(
     cutoff: float,
     min_tokens: int = 1,
 ) -> tuple[_Candidate | None, float, set[str]]:
-    """Find the candidate whose tokens (field_attr) have the highest coverage in haystack_tokens.
+    """Find the candidate with the strongest token overlap with the haystack.
 
-    Returns (best_candidate, coverage_fraction, matched_tokens). best_candidate is None if no
-    candidate meets the cutoff.
+    Score is `max(forward, reverse)` where:
+      forward = matched_weight / cand_weight   — how completely the candidate is covered
+      reverse = matched_weight / file_weight   — how informed the haystack is by the candidate
+
+    Tokens contribute by length (longer = more discriminating), so a 7-letter
+    overlap on "bermuda" outweighs a 3-letter overlap on "the".
+
+    Taking the max lets us match in both directions: a verbose filename whose
+    tokens fully cover a short candidate name, AND a terse filename that
+    contains most of a long candidate name. Either signal is good evidence.
     """
     best: _Candidate | None = None
-    best_cov = cutoff - 0.0001
+    best_score = cutoff - 0.0001
     best_matched: set[str] = set()
+    haystack_weight = sum(len(t) for t in haystack_tokens) or 1
     for c in candidates:
         toks: set[str] = getattr(c, field_attr)
         if not toks or len(toks) < min_tokens:
             continue
         matched = toks & haystack_tokens
-        cov = len(matched) / len(toks)
-        if cov > best_cov:
-            best, best_cov, best_matched = c, cov, matched
-    return (best, best_cov, best_matched) if best else (None, 0.0, set())
+        if not matched:
+            continue
+        matched_weight = sum(len(t) for t in matched)
+        cand_weight = sum(len(t) for t in toks) or 1
+        forward = matched_weight / cand_weight
+        reverse = matched_weight / haystack_weight
+        score = max(forward, reverse)
+        if score > best_score:
+            best, best_score, best_matched = c, score, matched
+    return (best, best_score, best_matched) if best else (None, 0.0, set())
 
 
 def _best_fuzzy(
@@ -211,38 +251,52 @@ def _best_fuzzy(
     return (best, best_ratio) if best else (None, 0.0)
 
 
-def _identify(path: Path, candidates: list[_Candidate]) -> tuple[_Candidate | None, str, str]:
-    """Return (best_candidate, confidence, decision) — decision explains why this match was chosen."""
-    norm_filename = _normalise(path.stem)
-    fname_tokens = _tokens(path.stem)
+def _identify(
+    path: Path,
+    input_dir: Path,
+    candidates: list[_Candidate],
+    supplier_narrowed: bool,
+) -> tuple[_Candidate | None, str, str]:
+    """Return (best_candidate, confidence, decision) — decision explains why this match was chosen.
 
-    # 1. Filename contains an exact SKU / supplier ref / product name (HIGH)
-    if c := _longest_substring_match(norm_filename, candidates, "norm_sku"):
-        return c, "HIGH", f"Filename contains SKU '{c.sku}'"
-    if c := _longest_substring_match(norm_filename, candidates, "norm_ref"):
-        return c, "HIGH", f"Filename contains supplier ref '{c.supplier_ref}'"
-    if c := _longest_substring_match(norm_filename, candidates, "norm_name"):
-        return c, "HIGH", f"Filename contains product name '{c.name}'"
+    The haystack is the full relative path (parent folders + stem), not just
+    the stem, so files in product-named directories match correctly.
 
-    # 2. Token coverage on filename — partial match against name / supplier ref (MEDIUM)
+    When `supplier_narrowed` is True, fuzzy and token-coverage cutoffs are
+    relaxed because cross-supplier collisions are impossible.
+    """
+    norm_path, path_tokens = _haystack(path, input_dir)
+
+    fuzzy_cutoff = _FUZZY_CUTOFF_SUPPLIER if supplier_narrowed else _FUZZY_CUTOFF
+    coverage_cutoff = _TOKEN_COVERAGE_CUTOFF_SUPPLIER if supplier_narrowed else _TOKEN_COVERAGE_CUTOFF
+
+    # 1. Path contains an exact SKU / supplier ref / product name (HIGH)
+    if c := _longest_substring_match(norm_path, candidates, "norm_sku"):
+        return c, "HIGH", f"Path contains SKU '{c.sku}'"
+    if c := _longest_substring_match(norm_path, candidates, "norm_ref"):
+        return c, "HIGH", f"Path contains supplier ref '{c.supplier_ref}'"
+    if c := _longest_substring_match(norm_path, candidates, "norm_name"):
+        return c, "HIGH", f"Path contains product name '{c.name}'"
+
+    # 2. Token coverage on path — partial match against name / supplier ref (MEDIUM)
     name_c, name_cov, name_hit = _best_token_coverage(
-        fname_tokens, candidates, "tok_name", _TOKEN_COVERAGE_CUTOFF, min_tokens=2,
+        path_tokens, candidates, "tok_name", coverage_cutoff, min_tokens=2,
     )
     ref_c, ref_cov, ref_hit = _best_token_coverage(
-        fname_tokens, candidates, "tok_ref", _TOKEN_COVERAGE_CUTOFF, min_tokens=1,
+        path_tokens, candidates, "tok_ref", coverage_cutoff, min_tokens=1,
     )
     # Prefer whichever scored higher; bias toward names (multi-token, more discriminating).
     if name_c and (not ref_c or name_cov >= ref_cov):
         hit = ", ".join(sorted(name_hit))
         return name_c, "MEDIUM", (
-            f"Filename matches {len(name_hit)}/{len(name_c.tok_name)} tokens of "
-            f"product name '{name_c.name}' ({hit})"
+            f"Path matches {len(name_hit)}/{len(name_c.tok_name)} tokens of "
+            f"product name '{name_c.name}' ({hit}, score {name_cov:.0%})"
         )
     if ref_c:
         hit = ", ".join(sorted(ref_hit))
         return ref_c, "MEDIUM", (
-            f"Filename matches {len(ref_hit)}/{len(ref_c.tok_ref)} tokens of "
-            f"supplier ref '{ref_c.supplier_ref}' ({hit})"
+            f"Path matches {len(ref_hit)}/{len(ref_c.tok_ref)} tokens of "
+            f"supplier ref '{ref_c.supplier_ref}' ({hit}, score {ref_cov:.0%})"
         )
 
     # 3. PDF content — title metadata + first-page text (MEDIUM/LOW)
@@ -259,19 +313,19 @@ def _identify(path: Path, candidates: list[_Candidate]) -> tuple[_Candidate | No
                 return c, "MEDIUM", f"PDF text contains product name '{c.name}'"
         if pdf_tokens:
             name_c, name_cov, name_hit = _best_token_coverage(
-                pdf_tokens, candidates, "tok_name", _TOKEN_COVERAGE_CUTOFF, min_tokens=2,
+                pdf_tokens, candidates, "tok_name", coverage_cutoff, min_tokens=2,
             )
             if name_c:
                 hit = ", ".join(sorted(name_hit))
                 return name_c, "LOW", (
                     f"PDF text matches {len(name_hit)}/{len(name_c.tok_name)} tokens of "
-                    f"product name '{name_c.name}' ({hit})"
+                    f"product name '{name_c.name}' ({hit}, score {name_cov:.0%})"
                 )
 
     # 4. Fuzzy match against SKU / supplier ref / product name (LOW)
-    sku_c, sku_r = _best_fuzzy(norm_filename, candidates, "norm_sku", _FUZZY_CUTOFF)
-    ref_c, ref_r = _best_fuzzy(norm_filename, candidates, "norm_ref", _FUZZY_CUTOFF)
-    name_c, name_r = _best_fuzzy(norm_filename, candidates, "norm_name", _FUZZY_CUTOFF)
+    sku_c, sku_r = _best_fuzzy(norm_path, candidates, "norm_sku", fuzzy_cutoff)
+    ref_c, ref_r = _best_fuzzy(norm_path, candidates, "norm_ref", fuzzy_cutoff)
+    name_c, name_r = _best_fuzzy(norm_path, candidates, "norm_name", fuzzy_cutoff)
     candidates_with_score = [
         (sku_c, sku_r, "SKU", lambda x: x.sku),
         (ref_c, ref_r, "supplier ref", lambda x: x.supplier_ref),
@@ -302,11 +356,12 @@ def build_report(
     candidates = _build_candidates(
         sheet_rows, sku_col, name_col, supplier_col, supplier_ref_col, supplier_filter,
     )
+    supplier_narrowed = bool(supplier_filter)
 
     matches: list[FileMatch] = []
     for path in sorted(_walk_files(input_dir)):
         rel_path = str(path.relative_to(input_dir))
-        cand, confidence, reason = _identify(path, candidates)
+        cand, confidence, reason = _identify(path, input_dir, candidates, supplier_narrowed)
 
         if cand:
             if structure == "flat":

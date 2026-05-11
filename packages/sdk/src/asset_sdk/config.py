@@ -135,10 +135,91 @@ class PhotosGenerateConfig:
         return sum(self.cost_for(models[i % len(models)]) for i in range(attempts))
 
 
+_DEFAULT_VIDEO_PROMPT = (
+    "Smooth, continuous turntable rotation: the product rotates slowly in "
+    "place around its vertical axis, transitioning naturally from the first "
+    "frame's pose to the last frame's pose. The product stays planted on the "
+    "ground, centered in frame, fully visible, and never lifts, tilts, or "
+    "shifts position — only its rotation moves. The camera is completely "
+    "locked and static — no pan, no tilt, no dolly, no zoom, no orbit, no "
+    "parallax, no shake. The frame is perfectly still. Photorealistic, soft "
+    "natural studio lighting, clean white background. No text, watermarks, "
+    "logos, captions, or overlays."
+)
+
+
+_DEFAULT_VIDEO_MODEL_COSTS: dict[str, float] = {
+    # Replicate pricing snapshots — update when their list changes.
+    "bytedance/seedance-2.0":         0.50,    # estimate; verify after first run
+    "bytedance/seedance-2.0-fast":    0.25,    # estimate; verify after first run
+    "bytedance/seedance-1-pro":       0.30,
+    "bytedance/seedance-1-pro-fast":  0.15,
+    "bytedance/seedance-1-lite":      0.15,
+    "kwaivgi/kling-v2.5-turbo-pro":   0.50,
+    "kwaivgi/kling-v2.1":             0.50,
+    "google/veo-3":                   3.00,
+    "google/veo-3.1":                 3.00,
+    "runwayml/gen4-turbo":            1.25,
+}
+
+
+@dataclass
+class VideoGenerateConfig:
+    # Replicate model slugs tried in order, cycling on retry. Provider is
+    # always Replicate for now (gpt-* and gemini-* don't ship image-to-video
+    # yet in our setup).
+    models:              list[str] = field(default_factory=lambda: ["bytedance/seedance-2.0"])
+    duration_seconds:    int       = 10
+    resolution:          str       = "720p"     # 480p | 720p | 1080p (model-dependent)
+    # 9:16 by default — vertical, ready for IG Reels / YouTube Shorts.
+    # 16:9 / 4:3 / 1:1 / 3:4 / 9:16 / 21:9 / 9:21 are valid Seedance values.
+    # Note: Seedance 1.x ignores this field when an image is supplied, so
+    # the stage pre-letterboxes each keyframe to this ratio as a safety net
+    # (harmless on 2.0, which honors aspect_ratio with image inputs).
+    aspect_ratio:        str       = "9:16"
+    # Lock the camera so Seedance only animates the subject (no dolly /
+    # pan / tilt / zoom). Honored by Seedance 1.x only — 2.0 dropped this
+    # field, so we lean on the default prompt to enforce a static camera.
+    camera_fixed:        bool      = True
+    # Use the first AND last white-bg photo as start + end keyframes (via
+    # Seedance's `last_frame_image`). Disable for single-frame mode.
+    use_last_frame:      bool      = True
+    # When --add-background is set, the stage switches to reference-images
+    # mode (Seedance 2.0+) and uses up to this many white-bg photos as
+    # identity / style references. Seedance caps at 9.
+    max_reference_images: int      = 9
+    # Used by `--add-background` (no value) and `--add-audio` (no value).
+    # `--background "..."` / `--audio "..."` override these per-run.
+    default_background:  str       = "a nice minimalist villa"
+    default_audio:       str       = "smooth jazz"
+    default_prompt:      str       = _DEFAULT_VIDEO_PROMPT
+    # Replicate API token is read from REPLICATE_API_TOKEN env var.
+    max_retries:         int       = 1          # video gen is slow + expensive; retry sparingly
+    cost_per_video_usd:  float     = 0.0        # 0 → auto-fill from model_costs[models[0]]
+    model_costs:         dict[str, float] = field(default_factory=lambda: dict(_DEFAULT_VIDEO_MODEL_COSTS))
+
+    def __post_init__(self) -> None:
+        if not self.cost_per_video_usd and self.models:
+            self.cost_per_video_usd = self.model_costs.get(self.models[0], 0.30)
+
+    def cost_for(self, model: str) -> float:
+        m = model.strip()
+        if m in self.model_costs and self.model_costs[m]:
+            return float(self.model_costs[m])
+        return float(self.cost_per_video_usd)
+
+    def worst_case_cost_per_video(self, models: list[str], max_retries: int) -> float:
+        if not models:
+            return 0.0
+        attempts = 1 + max(0, max_retries)
+        return sum(self.cost_for(models[i % len(models)]) for i in range(attempts))
+
+
 @dataclass
 class GenerateConfig:
     report_tab: str = "Generate Report"
     photos:     PhotosGenerateConfig = field(default_factory=PhotosGenerateConfig)
+    video:      VideoGenerateConfig  = field(default_factory=VideoGenerateConfig)
 
 
 @dataclass
@@ -277,10 +358,29 @@ class PipelineConfig:
             # Merge user overrides on top of defaults so partial overrides work.
             for k, v in model_costs_override.items():
                 photos_cfg.model_costs[str(k).strip()] = float(v)
-        # Build top-level GenerateConfig with the nested photos.
-        gen_top = {k: v for k, v in gen_raw.items() if k != "photos"}
+        # Nested video config under [generate.video] (with optional
+        # [generate.video.model_costs] override map).
+        video_raw = gen_raw.get("video", {}) or {}
+        video_model_costs_override = video_raw.get("model_costs")
+        video_section = {
+            k: v for k, v in video_raw.items() if k != "model_costs"
+        }
+        video_cfg = _build(VideoGenerateConfig, video_section)
+        if isinstance(video_model_costs_override, dict):
+            for k, v in video_model_costs_override.items():
+                video_cfg.model_costs[str(k).strip()] = float(v)
+        # Re-run __post_init__ logic since _build skips it when fields are
+        # assigned after construction.
+        if not video_cfg.cost_per_video_usd and video_cfg.models:
+            video_cfg.cost_per_video_usd = video_cfg.model_costs.get(
+                video_cfg.models[0], 0.30,
+            )
+
+        # Build top-level GenerateConfig with the nested photos + video.
+        gen_top = {k: v for k, v in gen_raw.items() if k not in ("photos", "video")}
         generate_cfg = _build(GenerateConfig, gen_top)
         generate_cfg.photos = photos_cfg
+        generate_cfg.video = video_cfg
 
         return cls(
             csv=_build(CsvConfig, raw.get("csv", {})),
