@@ -24,7 +24,12 @@ import re
 import subprocess
 
 import numpy as np
-from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont as _PILFont
+from PIL import (
+    Image as _PILImage,
+    ImageDraw as _PILDraw,
+    ImageFilter as _PILFilter,
+    ImageFont as _PILFont,
+)
 
 from asset_sdk.adapters import drive
 
@@ -225,6 +230,104 @@ def build_plan(
     return plans
 
 
+def analyze_motion_for_plans(
+    plans: list["VideoPlan"],
+    *,
+    category_folder_id: str,
+    structure: str,
+    photos_subdir: str,
+    duration_seconds: int,
+    default_prompt: str = "",
+    motion_model: str = "claude-sonnet-4-6",
+    max_photos_per_sku: int = 9,
+    logger=print,
+) -> int:
+    """For every GENERATE plan with photos, download a sample of the source
+    images, ask Claude what camera motion would best showcase the product,
+    and overwrite `plan.prompt_override` with the resulting motion-style
+    block so the suggestion shows up in the dry-run report's Prompt cell.
+
+    SKUs whose Prompt cell already differs from `default_prompt` are
+    treated as user-curated and SKIPPED — we won't clobber an explicit
+    user-written prompt with Claude's suggestion. (For a fresh dry-run all
+    plans have prompt_override == default_prompt, so analysis runs on
+    everything; once you've edited a row, subsequent --analyze-motion
+    runs leave that row alone.)
+
+    Returns the number of plans analyzed."""
+    sku_index = _build_sku_index(category_folder_id, structure)
+    client = None
+    analyzed = 0
+    failed: list[str] = []
+    default_stripped = (default_prompt or "").strip()
+
+    for plan in plans:
+        if plan.action != "GENERATE":
+            continue
+        if not plan.source_photos:
+            continue
+        if plan.sku not in sku_index:
+            continue
+        # Respect prior user edits — only refresh cells that still hold
+        # the configured default prompt (or are empty).
+        cur = (plan.prompt_override or "").strip()
+        if cur and cur != default_stripped:
+            logger(f"  [motion] {plan.sku}: keeping user-edited Prompt cell")
+            continue
+
+        _, sku_id = sku_index[plan.sku]
+        with tempfile.TemporaryDirectory(prefix=f"motion_{plan.sku}_") as tmp:
+            tp = _Path(tmp)
+            drive_files = _list_photos(sku_id, photos_subdir)
+            name_to_meta = {f["name"]: f for f in drive_files}
+            selected = [
+                name_to_meta[n] for n in plan.source_photos[:max_photos_per_sku]
+                if n in name_to_meta
+            ]
+            if not selected:
+                continue
+            paths: list[str] = []
+            for f in selected:
+                local = str(tp / f["name"])
+                try:
+                    drive.download_file(f["id"], local)
+                    paths.append(local)
+                except Exception as exc:
+                    logger(f"  [motion] {plan.sku}: download failed for {f['name']}: {exc}")
+            if not paths:
+                continue
+
+            if client is None:
+                try:
+                    client = _anthropic_motion_client()
+                except Exception as exc:
+                    logger(f"  ⚠ motion-analysis client setup failed: {exc}")
+                    return analyzed  # bail — no point trying further SKUs
+
+            try:
+                motion = _suggest_camera_motion(
+                    client,
+                    parent_product=plan.parent_product,
+                    photo_paths=paths,
+                    duration_seconds=duration_seconds,
+                    model=motion_model,
+                )
+            except Exception as exc:
+                failed.append(plan.sku)
+                logger(f"  [motion] {plan.sku}: Claude call failed: {exc}")
+                continue
+
+            plan.prompt_override = _build_motion_style_block(
+                plan.parent_product, motion,
+            )
+            analyzed += 1
+            logger(f"  [motion] {plan.sku}: {motion}")
+
+    if failed:
+        logger(f"  [motion] {len(failed)} SKU(s) failed; left with default prompt")
+    return analyzed
+
+
 _ACTION_ORDER = {"GENERATE": 0, "SKIP": 1}
 
 
@@ -265,62 +368,80 @@ def build_prompt(
     background: str = "",
     audio: str = "",
     reference_count: int = 0,
+    camera_motion: str = "",
 ) -> str:
-    """Compose the final prompt.
+    """Compose the final seedance prompt as four orthogonal sections:
 
-    Default flow: subject line + the configured motion/style block + any
-    user extras.
+        1. [Subject + scene] — built from the Background cell. Empty cell
+           defaults to "clean white studio". Non-empty cell switches to
+           "place the product in <scene>" framing for reference-images mode.
+        2. [Motion + geometry] — built from camera_motion (Claude / user)
+           OR the configured default_prompt. This section is BACKGROUND-
+           NEUTRAL by construction so it never contradicts section 1.
+        3. [Extra prompt] — appended from the CLI's --prompt flag.
+        4. [Audio] — Seedance 2.0+'s background-music instruction.
 
-    When `background` is supplied: builds a "place the product in <scene>"
-    prompt that overrides the white-studio framing and asks the model to
-    integrate the product photorealistically. Used by --add-background +
-    reference-images mode (Seedance 2.0+).
-
-    When `audio` is supplied: appends an instruction for Seedance 2.0+'s
-    audio synthesis to generate background music of the requested style and
-    explicitly suppress dialogue / voiceover."""
+    Earlier versions hard-coded "clean white background" inside the motion
+    block, which silently overrode the Background cell. Section 1 now owns
+    the background entirely."""
     pp = parent_product.strip() or "product"
     parts: list[str] = []
 
+    # --- Section 1: subject + scene ---
     if background.strip():
         bg = background.strip()
-        parts.append(f"A short cinematic shot of a {pp} placed in {bg}.")
+        parts.append(
+            f"A short cinematic shot of a {pp} placed in {bg}. Photorealistic "
+            "integration: appropriate lighting, soft natural shadows, contact "
+            "shadows on the floor, and reflections / occlusion that match the "
+            f"environment. The scene around the {pp} stays completely constant "
+            "throughout the clip — same composition, same lighting, same "
+            "shadows, same surfaces."
+        )
+        # Constrain the model's imagination: it tends to invent random
+        # foreground clutter (a stray puddle, leaves, animals, decorative
+        # objects) unless explicitly told the scene is empty around the product.
+        parts.append(
+            f"The setting is empty and minimal around the {pp}: NO other "
+            "objects of any kind in the scene — no decorative items, no "
+            "furniture clutter, no plants or foliage, no animals, no people, "
+            "no debris, no puddles or wet patches on the floor, no shadows of "
+            f"things outside the frame, no reflections of objects that aren't "
+            f"the {pp}. The {pp} is the ONLY subject; the rest of the scene is "
+            "just the environment described above, kept clean and uncluttered."
+        )
         if reference_count > 0:
             refs = ", ".join(f"[Image{i+1}]" for i in range(reference_count))
             parts.append(
-                f"The {pp} must exactly match the shape, materials, proportions, and "
-                f"design shown in the reference images ({refs}). Treat those references "
-                "as the ground truth for what the product looks like."
+                f"The {pp} must exactly match the shape, materials, proportions, "
+                f"and design shown in the reference images ({refs}). Treat those "
+                "references as the ground truth for what the product looks like."
             )
-        parts.append(
-            f"Replace the white studio background with {bg}. Photorealistic integration: "
-            "appropriate lighting, soft natural shadows, contact shadows on the floor, "
-            "and reflections / occlusion that match the environment."
-        )
-        parts.append(
-            f"The camera makes a slow, smooth push-in toward the {pp} with a very "
-            "gentle frame shift — subtle, elegant motion only. The product itself is "
-            f"completely static: the {pp} does not rotate, tilt, lift, deform, or "
-            "change pose; only the camera moves. Every part of the product — its "
-            "geometry, topology, part count, silhouette, and details — is identical "
-            "in every frame; nothing is added, duplicated, split, or hallucinated. "
-            "The scene around the product stays completely constant: same composition, "
-            "same lighting, same shadows, same surfaces."
-        )
-        parts.append("Photorealistic. No text, watermarks, logos, captions, or overlays.")
     else:
-        parts.append(f"A short promotional video of a {pp}.")
-        if default_prompt.strip():
-            parts.append(default_prompt.strip())
+        parts.append(
+            f"A short promotional video of a {pp} on a clean white studio "
+            "background — bright, evenly lit, no other objects in frame."
+        )
 
+    # --- Section 2: motion + geometry block ---
+    if camera_motion.strip():
+        # Claude / user supplied a specific motion. Use the shared
+        # background-neutral motion-style block.
+        parts.append(_build_motion_style_block(pp, camera_motion))
+    elif default_prompt.strip():
+        parts.append(default_prompt.strip())
+
+    # --- Section 3: extra user guidance ---
     if extra_prompt and extra_prompt.strip():
         parts.append(extra_prompt.strip())
 
+    # --- Section 4: audio ---
     if audio.strip():
         parts.append(
-            f"Audio: {audio.strip()} background music throughout, instrumental only. "
-            "No dialogue, no voiceover, no spoken words, no sound effects."
+            f"Audio: {audio.strip()} background music throughout, instrumental "
+            "only. No dialogue, no voiceover, no spoken words, no sound effects."
         )
+
     return " ".join(parts)
 
 
@@ -328,6 +449,124 @@ def _is_seedance_v2(model: str) -> bool:
     """Seedance 2.0+ supports reference_images / generate_audio; v1.x has
     camera_fixed instead and no audio / reference inputs."""
     return model.strip().lower().startswith("bytedance/seedance-2")
+
+
+def _anthropic_motion_client():
+    """Reuse the same Anthropic client builder the photo verifier uses, so
+    we share the ANTHROPIC_API_KEY env var contract."""
+    from asset_sdk.stages.generate_photos import _anthropic_client
+    return _anthropic_client()
+
+
+def _build_motion_style_block(parent_product: str, camera_motion: str) -> str:
+    """Compose the motion + geometry block that gets either (a) baked into
+    the Prompt cell at dry-run time when --analyze-motion is used, or
+    (b) returned by build_prompt's camera_motion branch at execute time.
+
+    The block is intentionally BACKGROUND-NEUTRAL — it talks about how the
+    camera moves and how the product's geometry stays locked, but does not
+    mention the scene. build_prompt assembles the scene separately from
+    the Background cell so the two concerns don't fight each other."""
+    pp = parent_product.strip() or "product"
+    motion = camera_motion.strip().rstrip(".")
+    return (
+        f"Camera motion: {motion}. The camera is mounted on a fully stabilized "
+        "professional tripod or motorized gimbal — every frame is rock-steady, "
+        "mechanically smooth, with absolutely no handheld feel, no micro-jitter, "
+        "no wobble, no shake, no float, no breathing of the frame. The motion is "
+        "deliberate and locked, as if shot on a robotic motion-control rig. "
+        f"The {pp} itself is completely static: it does not rotate, tilt, lift, "
+        "deform, or change pose in any way; only the camera moves as described. "
+        "Every part of the product — its geometry, topology, part count, "
+        "silhouette, materials, and surface details — is identical in every "
+        "single frame. Nothing is added, duplicated, split, removed, or "
+        "hallucinated as the camera moves. Photorealistic, soft natural "
+        "lighting. No text, watermarks, logos, captions, or overlays."
+    )
+
+
+def _suggest_camera_motion(
+    anthropic_client,
+    *,
+    parent_product: str,
+    photo_paths: list[str],
+    duration_seconds: int,
+    model: str = "claude-sonnet-4-6",
+    max_photos: int = 9,
+) -> str:
+    """Ask Claude to analyze the available photos and recommend a camera
+    motion that best showcases the product's distinctive angles.
+
+    Sends up to `max_photos` images (Sonnet 4.6 handles 9 fine) along with
+    a task prompt. Returns a 1-2 sentence motion description ready to
+    inject as the `camera_motion` field of build_prompt.
+
+    Costs ~$0.01-0.02 per call for Sonnet 4.6 with 5-9 images. Skipped
+    entirely unless --analyze-motion is passed."""
+    # Use the same image-prep helpers as the photo verifier — they handle
+    # the 5MB Claude limit + JPEG re-encoding.
+    from asset_sdk.stages.generate_photos import _image_block
+
+    pp = parent_product.strip() or "product"
+    selected = photo_paths[: max(1, int(max_photos))]
+    n = len(selected)
+
+    prompt = (
+        f"You are advising on camera motion for a {duration_seconds}-second "
+        f"AI-generated promotional product video of a {pp}. Below are {n} "
+        f"reference photograph(s) of this exact product, taken from various "
+        f"angles.\n\n"
+        f"Your task: recommend a camera motion that best showcases this "
+        f"specific product. The camera will move; the product stays static.\n\n"
+        f"Hard constraints:\n"
+        f"- Motion must be subtle, smooth, and short — it has to fit naturally "
+        f"in {duration_seconds} seconds.\n"
+        f"- The product NEVER rotates or moves itself; only the camera moves "
+        f"around it.\n"
+        f"- No rapid moves, no full 360 orbit, no shake.\n\n"
+        f"Decision rules — apply in order:\n"
+        f"1. If the photos clearly show interesting features on multiple sides "
+        f"(e.g. front + a distinctive back, or front + a detailed side), "
+        f"recommend a SLIGHT camera arc / partial orbit (30-90 degrees, no "
+        f"more) that reveals that second angle by the end of the clip. Name "
+        f"the feature being revealed (e.g. \"the carved backrest\", \"the "
+        f"upholstered side panel\").\n"
+        f"2. If the photos only show front / 3-quarter views, or the product "
+        f"is visually similar from every angle, recommend a simple PUSH-IN "
+        f"toward the product with very gentle parallax — no orbit.\n"
+        f"3. If the product is plain (cylindrical, symmetrical, low-detail), "
+        f"a slow push-in is fine.\n\n"
+        f"Output: ONLY 1-2 sentences describing the camera motion. No "
+        f"preamble, no caveats, no markdown. Begin directly with the motion. "
+        f"This sentence will be appended verbatim to a video-generation "
+        f"prompt.\n\n"
+        f"Good examples:\n"
+        f"- Slow push-in toward the front, then a gentle arc to the right "
+        f"during the last second to reveal the carved backrest.\n"
+        f"- Simple slow push-in with very gentle parallax. No orbit.\n"
+        f"- Subtle camera arc from front to 3/4 left over the duration of "
+        f"the clip, settling on a view of the upholstered armrest."
+    )
+
+    images = [_image_block(p) for p in selected]
+
+    response = anthropic_client.messages.create(
+        model=model,
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}, *images],
+        }],
+    )
+
+    text = ""
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) == "text":
+            text = block.text
+            break
+    # Strip any markdown / quote framing Claude might add despite the prompt.
+    cleaned = text.strip().strip("`").strip('"').strip()
+    return cleaned
 
 
 def _classify_image_type(local_path: str) -> str:
@@ -541,8 +780,9 @@ def _render_title_overlay_png(
     out_path: str,
 ) -> None:
     """Render the title TEXT only (transparent background) at video
-    dimensions, anchored bottom-center. A subtle white outline keeps the
-    text legible on varied first-frame backgrounds."""
+    dimensions, anchored bottom-center. Solid fill in `text_color`, no
+    stroke — pair with `card_text_color` in config to pick the color that
+    reads cleanly against the product backdrop."""
     canvas = _PILImage.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = _PILDraw.Draw(canvas)
     # Text budget: 84% of width, 14% of height. Roomy for long names.
@@ -555,15 +795,7 @@ def _render_title_overlay_png(
     # Baseline 88% down from the top — keeps clear of the bottom safe-area
     # without crowding the product.
     y = int(height * 0.88) - th - bbox[1]
-    font_size = getattr(font, "size", 32)
-    stroke_w = max(2, int(font_size * 0.04))
-    draw.text(
-        (x, y), text,
-        fill=_hex_to_rgb(text_color),
-        font=font,
-        stroke_width=stroke_w,
-        stroke_fill=(255, 255, 255, 200),
-    )
+    draw.text((x, y), text, fill=_hex_to_rgb(text_color), font=font)
     canvas.save(out_path, "PNG")
 
 
@@ -622,6 +854,7 @@ def _build_bookend_clip(
     duration: float,
     with_audio: bool,
     out_path: str,
+    apply_blur: bool = False,
 ) -> None:
     """Build a `duration`-second mp4 of a still frame with a transparent
     overlay composited on top, animated with an alpha fade.
@@ -631,24 +864,64 @@ def _build_bookend_clip(
     `fade_kind="in"`  → overlay starts invisible, fades to fully visible
     (used for the logo outro at the end of the final video).
 
+    `apply_blur=True` → render a heavily-blurred companion of the still
+    via PIL and xfade from sharp→blurred over the full duration. Combined
+    with `fade_kind="in"`, this gives the "video softens as the logo
+    arrives" effect for the logo outro.
+
     A silent stereo AAC track is added when `with_audio=True` so this clip
     can be concat'd cleanly with audio-bearing seedance output."""
-    cmd: list[str] = [
-        _ffmpeg_exe(), "-y", "-loglevel", "error",
-        "-loop", "1", "-t", f"{duration:.3f}", "-i", still_frame_path,
-        "-loop", "1", "-t", f"{duration:.3f}", "-i", overlay_png,
-    ]
+    cmd: list[str] = [_ffmpeg_exe(), "-y", "-loglevel", "error"]
+
+    if apply_blur:
+        # Build the blurred companion via PIL so we can lean on a quality
+        # Gaussian. ffmpeg's gblur doesn't accept time-varying sigma, so
+        # we let xfade interpolate between sharp + blurred stills instead.
+        blurred_path = still_frame_path + ".blurred.jpg"
+        with _PILImage.open(still_frame_path) as img:
+            radius = max(20, int(min(img.size) * 0.04))
+            img.convert("RGB").filter(
+                _PILFilter.GaussianBlur(radius=radius)
+            ).save(blurred_path, "JPEG", quality=92)
+        cmd += [
+            "-loop", "1", "-t", f"{duration:.3f}", "-i", still_frame_path,
+            "-loop", "1", "-t", f"{duration:.3f}", "-i", blurred_path,
+            "-loop", "1", "-t", f"{duration:.3f}", "-i", overlay_png,
+        ]
+        overlay_in_idx = 2
+    else:
+        cmd += [
+            "-loop", "1", "-t", f"{duration:.3f}", "-i", still_frame_path,
+            "-loop", "1", "-t", f"{duration:.3f}", "-i", overlay_png,
+        ]
+        overlay_in_idx = 1
+
     if with_audio:
         cmd += ["-f", "lavfi", "-t", f"{duration:.3f}", "-i",
                 "anullsrc=channel_layout=stereo:sample_rate=44100"]
-    cmd += [
-        "-filter_complex",
-        f"[1:v]format=rgba,fade=t={fade_kind}:st=0:d={duration:.3f}:alpha=1[fx];"
-        f"[0:v][fx]overlay=x=0:y=0:format=auto[outv]",
-        "-map", "[outv]",
-    ]
+        audio_in_idx = overlay_in_idx + 1
+    else:
+        audio_in_idx = None
+
+    if apply_blur:
+        # xfade transitions [0:v] (sharp) → [1:v] (blurred) over the full
+        # `duration`, then we overlay the fading logo on top.
+        filter_complex = (
+            f"[0:v][1:v]xfade=transition=fade:duration={duration:.3f}:offset=0[bg];"
+            f"[{overlay_in_idx}:v]format=rgba,"
+            f"fade=t={fade_kind}:st=0:d={duration:.3f}:alpha=1[fx];"
+            f"[bg][fx]overlay=x=0:y=0:format=auto[outv]"
+        )
+    else:
+        filter_complex = (
+            f"[{overlay_in_idx}:v]format=rgba,"
+            f"fade=t={fade_kind}:st=0:d={duration:.3f}:alpha=1[fx];"
+            f"[0:v][fx]overlay=x=0:y=0:format=auto[outv]"
+        )
+
+    cmd += ["-filter_complex", filter_complex, "-map", "[outv]"]
     if with_audio:
-        cmd += ["-map", "2:a", "-c:a", "aac"]
+        cmd += ["-map", f"{audio_in_idx}:a", "-c:a", "aac"]
     cmd += [
         "-t", f"{duration:.3f}",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
@@ -680,6 +953,40 @@ def _concat_clips(
     subprocess.run(cmd, check=True, capture_output=True)
 
 
+def _overlay_title_on_video(
+    video_path: str,
+    title_png: str,
+    *,
+    duration: float,
+    output_path: str,
+) -> None:
+    """Composite a fading-out title overlay onto the FIRST `duration`
+    seconds of the actual playing video. Output keeps the same duration,
+    dimensions, and audio as the input — only the visual is modified
+    during the first second.
+
+    Visually: the title is fully visible at t=0 (frame 0 of seedance
+    motion), then fades to invisible by t=`duration` (frame 0 + ~30
+    frames). The product is moving underneath the title the whole time —
+    no still-frame intro."""
+    with_audio = _has_audio_stream(video_path)
+    cmd = [
+        _ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-i", video_path,
+        "-loop", "1", "-t", f"{duration:.3f}", "-i", title_png,
+        "-filter_complex",
+        f"[1:v]format=rgba,fade=t=out:st=0:d={duration:.3f}:alpha=1[title_fx];"
+        f"[0:v][title_fx]overlay=x=0:y=0:format=auto:"
+        f"enable='lt(t,{duration:.3f})'[outv]",
+        "-map", "[outv]",
+    ]
+    if with_audio:
+        # Copy audio verbatim — overlay only touches video.
+        cmd += ["-map", "0:a", "-c:a", "copy"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", output_path]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 def _apply_bookend_overlays(
     seedance_path: str,
     *,
@@ -690,41 +997,38 @@ def _apply_bookend_overlays(
     tmp_dir: _Path,
     output_path: str,
 ) -> None:
-    """Build the final mp4 = [title intro] + seedance + [logo outro].
+    """Build the final mp4 from the seedance clip + optional title and logo.
 
-    The intro is the seedance's first frame held for `title_seconds` with
-    the title overlay fading OUT (so the title reads at t=0 and clears
-    naturally before the product motion starts).
+    Title (when supplied): composited as an OVERLAY on the first
+    `title_seconds` of the actual playing video — fades out alpha 1→0.
+    Output duration is unchanged from the seedance clip for this step.
 
-    The outro is the seedance's last frame held for `logo_seconds` with
-    the logo overlay fading IN (logo arrives smoothly on the same pose
-    the product video ends on, then sits at full opacity until the cut).
+    Logo (when supplied): rendered as a BOOKEND clip appended after the
+    seedance — seedance's last frame held for `logo_seconds` with progressive
+    blur (sharp→blurred via xfade) while the logo fades in (alpha 0→1).
+    Extends total duration by `logo_seconds`.
 
-    Either bookend can be skipped by passing the corresponding *_png as
-    None. Raises if both are None — caller should just upload seedance
-    directly in that case."""
+    Either can be skipped by passing the corresponding *_png as None.
+    Raises if both are None — caller should upload seedance directly."""
     if not title_png and not logo_png:
         raise RuntimeError("_apply_bookend_overlays called with no overlays")
 
     with_audio = _has_audio_stream(seedance_path)
-    clips: list[str] = []
 
+    # Step 1: title overlay on the seedance (no time extension).
     if title_png:
-        first_frame = str(tmp_dir / "_first_frame.png")
-        _extract_frame(seedance_path, when="first", out_path=first_frame)
-        title_intro = str(tmp_dir / "_title_intro.mp4")
-        _build_bookend_clip(
-            still_frame_path=first_frame,
-            overlay_png=title_png,
-            fade_kind="out",
-            duration=title_seconds,
-            with_audio=with_audio,
-            out_path=title_intro,
+        titled_path = str(tmp_dir / "_seedance_titled.mp4")
+        _overlay_title_on_video(
+            seedance_path, title_png,
+            duration=title_seconds, output_path=titled_path,
         )
-        clips.append(title_intro)
+        main_video = titled_path
+    else:
+        main_video = seedance_path
 
-    clips.append(seedance_path)
-
+    # Step 2: logo bookend (extends duration). Last-frame extraction uses
+    # the original seedance — main_video's last frame is identical (title
+    # ended at t=title_seconds, well before the end).
     if logo_png:
         last_frame = str(tmp_dir / "_last_frame.png")
         _extract_frame(seedance_path, when="last", out_path=last_frame)
@@ -736,10 +1040,17 @@ def _apply_bookend_overlays(
             duration=logo_seconds,
             with_audio=with_audio,
             out_path=logo_outro,
+            # Soften the last frame as the logo arrives — background
+            # blurs progressively (sharp → blurred via xfade) while the
+            # logo overlay fades in.
+            apply_blur=True,
         )
-        clips.append(logo_outro)
-
-    _concat_clips(clips, output_path, with_audio=with_audio)
+        _concat_clips(
+            [main_video, logo_outro], output_path, with_audio=with_audio,
+        )
+    else:
+        # Only title applied — promote the titled clip to the final output.
+        os.rename(main_video, output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1202,8 @@ def execute(
     logo_card_seconds: float = 1.5,
     title_font_path: str = "",
     card_text_color: str = "#111111",
+    analyze_motion: bool = False,
+    motion_model: str = "claude-sonnet-4-6",
     max_retries: int = 1,
     debug: bool = False,
     logger=print,
@@ -903,7 +1216,8 @@ def execute(
                           error="no models configured (set generate.video.models in pipeline.config.toml)")
         return
 
-    client = None  # lazy
+    client = None  # lazy Replicate client
+    motion_client = None  # lazy Anthropic client, only built when --analyze-motion
 
     for plan in plans:
         if plan.action != "GENERATE":
@@ -1023,10 +1337,40 @@ def execute(
             effective_default_prompt = (
                 plan.prompt_override.strip() or default_prompt
             )
+
+            # Claude-driven camera motion analysis. Run only when:
+            #   - --analyze-motion is passed
+            #   - this SKU isn't using a custom Prompt cell (which already
+            #     dictates motion; we respect the user's explicit choice)
+            #   - we have downloaded photos to send Claude
+            sku_camera_motion = ""
+            if analyze_motion and not plan.prompt_override.strip() and downloaded:
+                if motion_client is None:
+                    try:
+                        motion_client = _anthropic_motion_client()
+                    except Exception as exc:
+                        logger(f"  ⚠ camera-motion client setup failed: {exc}")
+                        motion_client = False  # don't retry per SKU
+                if motion_client:
+                    motion_photo_paths = [p for (_n, p) in downloaded[:9]]
+                    try:
+                        sku_camera_motion = _suggest_camera_motion(
+                            motion_client,
+                            parent_product=plan.parent_product,
+                            photo_paths=motion_photo_paths,
+                            duration_seconds=duration,
+                            model=motion_model,
+                        )
+                        logger(f"  Claude motion: {sku_camera_motion}")
+                    except Exception as exc:
+                        logger(f"  ⚠ motion analysis failed, using default: {exc}")
+                        sku_camera_motion = ""
+
             prompt = build_prompt(
                 plan.parent_product, effective_default_prompt, extra_prompt,
                 background=sku_background, audio=sku_audio,
                 reference_count=len(ref_local_paths),
+                camera_motion=sku_camera_motion,
             )
             logger(f"  prompt: {prompt}")
             logger(
@@ -1143,13 +1487,13 @@ def execute(
                     parts = []
                     if apply_title:
                         parts.append(
-                            f"title intro {title_card_seconds:.1f}s (first frame + text, fade-out)"
+                            f"title overlay {title_card_seconds:.1f}s on playing video (fade-out)"
                         )
                     if apply_logo:
                         parts.append(
-                            f"logo outro {logo_card_seconds:.1f}s (last frame + logo, fade-in)"
+                            f"logo outro {logo_card_seconds:.1f}s (blurred last frame + logo, fade-in)"
                         )
-                    logger(f"  ✓ bookend overlays added ({', '.join(parts)})")
+                    logger(f"  ✓ card effects applied ({', '.join(parts)})")
                 except subprocess.CalledProcessError as exc:
                     stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:300]
                     logger(f"  ✗ ffmpeg failed: {stderr}")
@@ -1204,14 +1548,14 @@ def execute(
                          "_title.png", "image/png"),
                         (str(tmp_path / "_logo_overlay.png"),
                          "_logo.png", "image/png"),
-                        # Extracted bookend stills.
-                        (str(tmp_path / "_first_frame.png"),
-                         "_first_frame.png", "image/png"),
+                        # Last frame extracted for the logo outro bookend.
                         (str(tmp_path / "_last_frame.png"),
                          "_last_frame.png", "image/png"),
-                        # Composited 1s bookend clips.
-                        (str(tmp_path / "_title_intro.mp4"),
-                         "_title_intro.mp4", "video/mp4"),
+                        # Seedance clip with the title overlay composited on
+                        # its first second (intermediate before concat).
+                        (str(tmp_path / "_seedance_titled.mp4"),
+                         "_seedance_titled.mp4", "video/mp4"),
+                        # Composited 1s logo outro clip (still + blur + logo).
                         (str(tmp_path / "_logo_outro.mp4"),
                          "_logo_outro.mp4", "video/mp4"),
                     ]

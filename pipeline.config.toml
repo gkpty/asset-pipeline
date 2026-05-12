@@ -108,7 +108,7 @@ models             = ["bytedance/seedance-2.0"]
 # Seedance clip length (the product-motion middle). Title + logo bookends
 # add their own seconds on top, so total final = duration_seconds +
 # title_card_seconds + logo_card_seconds (default 6 + 1 + 1 = 8).
-duration_seconds   = 6
+duration_seconds   = 8
 resolution         = "720p"           # 480p | 720p | 1080p (Seedance enum)
 # 9:16 = vertical, ready for Instagram Reels / YouTube Shorts. Other valid
 # Seedance values: 16:9 / 4:3 / 1:1 / 3:4 / 21:9 / 9:21. The stage pre-
@@ -156,21 +156,25 @@ card_text_color    = "#111111"
 logo_drive_id      = "16kXAO7HFDP7pUEfTV3rYvjpqFRSB8bCU"
 max_retries        = 1                # video gen is slow/expensive; retry sparingly
 cost_per_video_usd = 0.0              # 0 → auto-fill from model_costs[models[0]]
+# Background-NEUTRAL motion + geometry block. The scene (white studio vs.
+# --background "..." scene) is owned by build_prompt's Section 1, so this
+# block must NOT mention "white background" / "studio" — keep it scene-
+# agnostic so Background cell edits never contradict it.
 default_prompt = """\
-A short, cinematic product shot. The camera makes a slow, smooth push-in \
-(subtle dolly forward) with a very gentle frame shift, ending slightly \
-tighter on the subject. Motion is continuous and elegant — no jumps, no \
-abrupt changes, no shake. The product itself is completely static: it \
-does not rotate, tilt, lift, deform, or change pose in any way; only the \
-camera moves. Every part of the product — its geometry, topology, part \
-count, silhouette, materials, and surface details — is identical in every \
-single frame. Nothing is added, duplicated, split, removed, or \
+The camera makes a slow, smooth push-in (subtle dolly forward) with a \
+very gentle frame shift, ending slightly tighter on the subject. The \
+camera is mounted on a fully stabilized professional tripod or motorized \
+gimbal — every frame is rock-steady, mechanically smooth, with absolutely \
+no handheld feel, no micro-jitter, no wobble, no shake, no float, no \
+breathing of the frame. The motion is deliberate and locked, as if shot \
+on a robotic motion-control rig. The product itself is completely static: \
+it does not rotate, tilt, lift, deform, or change pose in any way; only \
+the camera moves. Every part of the product — its geometry, topology, \
+part count, silhouette, materials, and surface details — is identical in \
+every single frame. Nothing is added, duplicated, split, removed, or \
 hallucinated as the camera moves; legs, panels, rails, and any other \
-components stay exactly the same in count and shape. The background and \
-environment stay completely constant throughout: same surroundings, same \
-lighting, same shadows, same colors, same composition behind the product. \
-Photorealistic, soft natural studio lighting, clean white background. No \
-text, watermarks, logos, captions, or overlays.\
+components stay exactly the same in count and shape. Photorealistic, \
+soft natural lighting. No text, watermarks, logos, captions, or overlays.\
 """
 
 [generate.video.model_costs]

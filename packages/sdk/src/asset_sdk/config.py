@@ -142,21 +142,25 @@ class PhotosGenerateConfig:
         return sum(self.cost_for(models[i % len(models)]) for i in range(attempts))
 
 
+# Background-neutral motion + geometry block. The scene (white studio vs.
+# --add-background scene) is handled separately by build_prompt's Section 1,
+# so this block must NOT mention "white background" / "studio" / similar.
 _DEFAULT_VIDEO_PROMPT = (
-    "A short, cinematic product shot. The camera makes a slow, smooth "
-    "push-in (subtle dolly forward) with a very gentle frame shift, ending "
-    "slightly tighter on the subject. Motion is continuous and elegant — no "
-    "jumps, no abrupt changes, no shake. The product itself is completely "
-    "static: it does not rotate, tilt, lift, deform, or change pose in any "
-    "way; only the camera moves. Every part of the product — its geometry, "
-    "topology, part count, silhouette, materials, and surface details — is "
-    "identical in every single frame. Nothing is added, duplicated, split, "
-    "removed, or hallucinated as the camera moves; legs, panels, rails, and "
-    "any other components stay exactly the same in count and shape. The "
-    "background and environment stay completely constant throughout: same "
-    "surroundings, same lighting, same shadows, same colors, same composition "
-    "behind the product. Photorealistic, soft natural studio lighting, clean "
-    "white background. No text, watermarks, logos, captions, or overlays."
+    "The camera makes a slow, smooth push-in (subtle dolly forward) with "
+    "a very gentle frame shift, ending slightly tighter on the subject. "
+    "The camera is mounted on a fully stabilized professional tripod or "
+    "motorized gimbal — every frame is rock-steady, mechanically smooth, "
+    "with absolutely no handheld feel, no micro-jitter, no wobble, no "
+    "shake, no float, no breathing of the frame. The motion is deliberate "
+    "and locked, as if shot on a robotic motion-control rig. The product "
+    "itself is completely static: it does not rotate, tilt, lift, deform, "
+    "or change pose in any way; only the camera moves. Every part of the "
+    "product — its geometry, topology, part count, silhouette, materials, "
+    "and surface details — is identical in every single frame. Nothing is "
+    "added, duplicated, split, removed, or hallucinated as the camera "
+    "moves; legs, panels, rails, and any other components stay exactly "
+    "the same in count and shape. Photorealistic, soft natural lighting. "
+    "No text, watermarks, logos, captions, or overlays."
 )
 
 

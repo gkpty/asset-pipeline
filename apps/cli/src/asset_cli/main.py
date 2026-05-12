@@ -1063,6 +1063,17 @@ def generate(
         help="(--type video) Google Drive file ID of the company logo. Overrides "
              "generate.video.logo_drive_id for this run. Implies --add-logo-card.",
     ),
+    analyze_motion: bool = typer.Option(
+        False, "--analyze-motion",
+        help="(--type video) For each SKU with photos, send the reference images "
+             "to Claude and ask for a camera motion that best showcases the product "
+             "(e.g. a slight pan to reveal a distinctive back on a chair vs a plain "
+             "push-in for a symmetrical product). Suggestions are baked into the "
+             "report's Prompt cell at dry-run time — review / edit them in Sheets "
+             "before --execute. Rows you've already edited (Prompt cell ≠ configured "
+             "default) are left alone. At --execute time without prior dry-run "
+             "analysis, falls back to per-SKU runtime analysis. Cost: ~$0.01-0.02/SKU.",
+    ),
     execute: bool = typer.Option(
         False, "--execute",
         help="Read the (possibly edited) report and apply. Omit for a dry run.",
@@ -1477,6 +1488,7 @@ def generate(
     # ------------------ VIDEO ------------------
     if requested == ["video"]:
         from asset_sdk.stages.generate_videos import (
+            analyze_motion_for_plans,
             build_plan as bp_video,
             execute as run_video,
             summarise as sum_video,
@@ -1537,6 +1549,24 @@ def generate(
                 "configure generate.video.logo_drive_id in pipeline.config.toml."
             )
 
+        # Resolve `title_font_path` relative to the config file's directory
+        # so users can write paths like "fonts/MyBrand.otf" in the TOML and
+        # have them work regardless of where they run `asset` from.
+        _resolved_font_path = video_cfg.title_font_path
+        if _resolved_font_path and not os.path.isabs(_resolved_font_path):
+            _resolved_font_path = str(
+                (config_path.resolve().parent / _resolved_font_path).resolve()
+            )
+        if (
+            _resolved_font_path
+            and add_title_card
+            and not os.path.isfile(_resolved_font_path)
+        ):
+            console.print(
+                f"[yellow]warning:[/yellow] title font not found at "
+                f"{_resolved_font_path!r} — falling back to system Helvetica."
+            )
+
         _cost_per = video_cfg.cost_for(_models[0])
         _worst_per_video = video_cfg.worst_case_cost_per_video(_models, _max_retries)
         photos_subdir = cfg.paths.product_photos
@@ -1576,6 +1606,31 @@ def generate(
         counts = sum_video(plans)
 
         if not execute:
+            # When --analyze-motion is set at dry-run, ask Claude to suggest
+            # a camera motion per SKU and bake the result into each plan's
+            # Prompt cell BEFORE writing the report. The user reviews +
+            # edits in Google Sheets; --execute then uses the cell verbatim.
+            if analyze_motion:
+                actionable = sum(1 for p in plans if p.action == "GENERATE" and p.source_photos)
+                console.print(
+                    f"[bold]Analyzing motion[/bold] for {actionable} SKU(s) via Claude "
+                    f"(~${actionable * 0.015:.2f} estimated Anthropic cost)…"
+                )
+                analyzed = analyze_motion_for_plans(
+                    plans,
+                    category_folder_id=category_folder_id,
+                    structure=structure,
+                    photos_subdir=photos_subdir,
+                    duration_seconds=video_cfg.duration_seconds,
+                    default_prompt=video_cfg.default_prompt,
+                    logger=console.print,
+                )
+                console.print(
+                    f"[bold]Motion analysis complete[/bold] — "
+                    f"{analyzed}/{actionable} SKUs analyzed; "
+                    "the Prompt cell shows what'll be sent to Seedance for each row."
+                )
+
             with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
                 t = progress.add_task(f"Writing report to '{_report_tab}'…", total=None)
                 headers, rows = rows_video(plans)
@@ -1612,10 +1667,11 @@ def generate(
                 f"\n                    clear the cell to keep that SKU on a white studio."
                 f"\n  • Audio         → audio style (only populated when --add-audio is"
                 f"\n                    passed). Non-empty enables Seedance 2.0+ music."
-                f"\n  • Prompt        → motion/style block, pre-filled with the configured"
-                f"\n                    default. Edit per-row to fix model artifacts (e.g."
-                f"\n                    'extra leg' on a chair) — your text replaces the"
-                f"\n                    default for that SKU. Clear the cell to fall back."
+                f"\n  • Prompt        → motion/style block. Pre-filled with the configured"
+                f"\n                    default, or with Claude's per-SKU camera-motion"
+                f"\n                    suggestion when --analyze-motion is passed. Edit"
+                f"\n                    per-row to refine; your text replaces the default"
+                f"\n                    for that SKU. Clear the cell to fall back."
                 f"\nThen re-run with --execute (and --budget to set a hard cost cap)."
             )
             return
@@ -1714,6 +1770,8 @@ def generate(
             cards_label.append(f"title={with_title}/{len(runnable)}")
         if _logo_on:
             cards_label.append("logo=all")
+        if analyze_motion:
+            cards_label.append("motion=claude")
         console.print(
             f"[bold]Running[/bold] {len(runnable)} video generations "
             f"(~${runnable_best_cost:.2f}–${runnable_worst_cost:.2f}, "
@@ -1744,8 +1802,9 @@ def generate(
             logo_local_path=_logo_local_path,
             title_card_seconds=video_cfg.title_card_seconds,
             logo_card_seconds=video_cfg.logo_card_seconds,
-            title_font_path=video_cfg.title_font_path,
+            title_font_path=_resolved_font_path,
             card_text_color=video_cfg.card_text_color,
+            analyze_motion=analyze_motion,
             max_retries=_max_retries,
             debug=debug,
             logger=console.print,
