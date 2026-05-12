@@ -78,8 +78,15 @@ _DEFAULT_MODEL_COSTS: dict[str, float] = {
     # OpenAI gpt-image-1 — quality-tiered. The dispatch falls back to the
     # quality-derived cost_per_image_usd for OpenAI models not listed here,
     # so we don't need a separate entry per quality tier.
+    "gpt-image-1":                     0.167,  # high quality estimate
     "gpt-image-2-2026-04-21":          0.167,  # estimate; update when verified
 }
+
+
+# Public read-only handles for the CLI's --models help text. These stay in
+# sync with the cost maps automatically — add a model + cost above and it
+# shows up in --help.
+KNOWN_PHOTO_MODELS: tuple[str, ...] = tuple(_DEFAULT_MODEL_COSTS.keys())
 
 
 @dataclass
@@ -136,15 +143,20 @@ class PhotosGenerateConfig:
 
 
 _DEFAULT_VIDEO_PROMPT = (
-    "Smooth, continuous turntable rotation: the product rotates slowly in "
-    "place around its vertical axis, transitioning naturally from the first "
-    "frame's pose to the last frame's pose. The product stays planted on the "
-    "ground, centered in frame, fully visible, and never lifts, tilts, or "
-    "shifts position — only its rotation moves. The camera is completely "
-    "locked and static — no pan, no tilt, no dolly, no zoom, no orbit, no "
-    "parallax, no shake. The frame is perfectly still. Photorealistic, soft "
-    "natural studio lighting, clean white background. No text, watermarks, "
-    "logos, captions, or overlays."
+    "A short, cinematic product shot. The camera makes a slow, smooth "
+    "push-in (subtle dolly forward) with a very gentle frame shift, ending "
+    "slightly tighter on the subject. Motion is continuous and elegant — no "
+    "jumps, no abrupt changes, no shake. The product itself is completely "
+    "static: it does not rotate, tilt, lift, deform, or change pose in any "
+    "way; only the camera moves. Every part of the product — its geometry, "
+    "topology, part count, silhouette, materials, and surface details — is "
+    "identical in every single frame. Nothing is added, duplicated, split, "
+    "removed, or hallucinated as the camera moves; legs, panels, rails, and "
+    "any other components stay exactly the same in count and shape. The "
+    "background and environment stay completely constant throughout: same "
+    "surroundings, same lighting, same shadows, same colors, same composition "
+    "behind the product. Photorealistic, soft natural studio lighting, clean "
+    "white background. No text, watermarks, logos, captions, or overlays."
 )
 
 
@@ -163,13 +175,16 @@ _DEFAULT_VIDEO_MODEL_COSTS: dict[str, float] = {
 }
 
 
+KNOWN_VIDEO_MODELS: tuple[str, ...] = tuple(_DEFAULT_VIDEO_MODEL_COSTS.keys())
+
+
 @dataclass
 class VideoGenerateConfig:
     # Replicate model slugs tried in order, cycling on retry. Provider is
     # always Replicate for now (gpt-* and gemini-* don't ship image-to-video
     # yet in our setup).
     models:              list[str] = field(default_factory=lambda: ["bytedance/seedance-2.0"])
-    duration_seconds:    int       = 10
+    duration_seconds:    int       = 6           # plus title+logo bookends → 8s typical final
     resolution:          str       = "720p"     # 480p | 720p | 1080p (model-dependent)
     # 9:16 by default — vertical, ready for IG Reels / YouTube Shorts.
     # 16:9 / 4:3 / 1:1 / 3:4 / 9:16 / 21:9 / 9:21 are valid Seedance values.
@@ -182,8 +197,13 @@ class VideoGenerateConfig:
     # field, so we lean on the default prompt to enforce a static camera.
     camera_fixed:        bool      = True
     # Use the first AND last white-bg photo as start + end keyframes (via
-    # Seedance's `last_frame_image`). Disable for single-frame mode.
-    use_last_frame:      bool      = True
+    # Seedance's `last_frame_image`). Disable for single-frame mode where
+    # the model interpolates motion from one keyframe + the prompt — this
+    # is the default because it gives the prompt full control over motion.
+    # Two keyframes at different angles FORCE the model into a rotation
+    # arc regardless of prompt, which historically caused "extra leg" type
+    # geometry hallucinations.
+    use_last_frame:      bool      = False
     # When --add-background is set, the stage switches to reference-images
     # mode (Seedance 2.0+) and uses up to this many white-bg photos as
     # identity / style references. Seedance caps at 9.
@@ -193,6 +213,25 @@ class VideoGenerateConfig:
     default_background:  str       = "a nice minimalist villa"
     default_audio:       str       = "smooth jazz"
     default_prompt:      str       = _DEFAULT_VIDEO_PROMPT
+
+    # --- Title + logo bookend overlays. -----------------------------------
+    # Enabled per-run via `--add-title-card` / `--add-logo-card`. The final
+    # video = title_intro (title_card_seconds) + seedance (duration_seconds)
+    # + logo_outro (logo_card_seconds). The intro is the seedance's FIRST
+    # frame frozen with the title text overlaid (fades out). The outro is
+    # the seedance's LAST frame frozen with the logo overlaid (fades in).
+    title_card_seconds:  float     = 1.0
+    logo_card_seconds:   float     = 1.0
+    # Empty path → auto-detect from a small list of system font candidates
+    # (Helvetica on macOS, DejaVu on Linux, Arial on Windows). Point this at
+    # a custom .ttf / .otf for branded typography.
+    title_font_path:     str       = ""
+    # Text color (hex). A subtle white outline is added automatically for
+    # legibility against varied backgrounds.
+    card_text_color:     str       = "#111111"
+    # Google Drive file ID of the company logo. Used by --add-logo-card.
+    # Override per-run with --logo-id. Empty → cards disabled.
+    logo_drive_id:       str       = ""
     # Replicate API token is read from REPLICATE_API_TOKEN env var.
     max_retries:         int       = 1          # video gen is slow + expensive; retry sparingly
     cost_per_video_usd:  float     = 0.0        # 0 → auto-fill from model_costs[models[0]]

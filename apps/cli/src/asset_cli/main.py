@@ -9,10 +9,29 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
 
+from asset_sdk.config import KNOWN_PHOTO_MODELS, KNOWN_VIDEO_MODELS
+
 load_dotenv()
 
 console = Console()
 app = typer.Typer(name="asset", help="Asset optimization pipeline CLI.")
+
+# Composed once at module load so the lists stay in sync with the cost-map
+# entries in asset_sdk.config. Used by --models help text.
+_MODELS_HELP = (
+    "Comma-separated list of models tried in order, cycling on retry. "
+    "Provider auto-detected from prefix.\n\n"
+    "(--type photos) "
+    "gpt-* / dall-* → OpenAI, gemini-* → Google. Known: "
+    + ", ".join(KNOWN_PHOTO_MODELS)
+    + ".\n\n"
+    "(--type video) "
+    "bytedance/seedance-* → Seedance (image-to-video, Replicate); "
+    "kwaivgi/* → Kling; google/veo-* → Veo; runwayml/* → Runway. Known: "
+    + ", ".join(KNOWN_VIDEO_MODELS)
+    + ".\n\n"
+    "Default: see generate.photos.models / generate.video.models in config."
+)
 
 
 @app.command()
@@ -966,9 +985,7 @@ def generate(
     ),
     models: Optional[str] = typer.Option(
         None, "--models",
-        help=("(--type photos) Comma-separated list of models tried in order, "
-              "cycling on retry. Provider auto-detected from prefix (gpt-* → "
-              "OpenAI, gemini-* → Google). Default: see generate.photos.models in config."),
+        help=_MODELS_HELP,
     ),
     quality: Optional[str] = typer.Option(
         None, "--quality",
@@ -1005,17 +1022,14 @@ def generate(
         help="(--type video) Extra motion / style guidance appended to the default "
              "video prompt. Example: --prompt 'orbit slowly around the chair'.",
     ),
-    add_background: bool = typer.Option(
-        False, "--add-background",
-        help="(--type video) Place the product in a scene instead of the white studio "
-             "background. Uses the configured default scene (see generate.video."
-             "default_background). Pair with --background to override the scene text. "
-             "Switches into Seedance 2.0+ reference-images mode.",
-    ),
     background_text: Optional[str] = typer.Option(
         None, "--background",
-        help="(--type video) Override the background scene description. Implies "
-             "--add-background. Example: --background 'sunlit Tokyo loft with oak floors'.",
+        help="(--type video) Override the background scene description for this run. "
+             "Pre-fills the report's Background column for every row; per-row edits "
+             "in the sheet still win. Default is generate.video.default_background "
+             "('a nice minimalist villa'). Pass --background '' to disable scene "
+             "replacement for this run (Background cells emptied). Non-empty "
+             "Background activates Seedance 2.0+ reference-images mode at execute.",
     ),
     add_audio: bool = typer.Option(
         False, "--add-audio",
@@ -1027,6 +1041,27 @@ def generate(
         None, "--audio",
         help="(--type video) Override the audio style description. Implies --add-audio. "
              "Example: --audio 'cinematic orchestral score'.",
+    ),
+    add_title_card: bool = typer.Option(
+        False, "--add-title-card",
+        help="(--type video) Prepend a title-intro bookend: the seedance's first "
+             "frame held for title_card_seconds (default 1s) with the product name "
+             "(from the sheet's `name` column, editable per-row in the Title cell) "
+             "overlaid at the bottom and fading out. Extends total video length by "
+             "title_card_seconds.",
+    ),
+    add_logo_card: bool = typer.Option(
+        False, "--add-logo-card",
+        help="(--type video) Append a logo-outro bookend: the seedance's last frame "
+             "held for logo_card_seconds (default 1s) with the company logo "
+             "overlaid in the center and fading in. Logo is downloaded from Drive "
+             "once per run — see generate.video.logo_drive_id (or --logo-id). "
+             "Extends total video length by logo_card_seconds.",
+    ),
+    logo_id: Optional[str] = typer.Option(
+        None, "--logo-id",
+        help="(--type video) Google Drive file ID of the company logo. Overrides "
+             "generate.video.logo_drive_id for this run. Implies --add-logo-card.",
     ),
     execute: bool = typer.Option(
         False, "--execute",
@@ -1461,26 +1496,45 @@ def generate(
         if _max_retries < 0:
             raise typer.BadParameter("--max-retries must be >= 0")
 
-        # Resolve --add-background / --background and --add-audio / --audio
-        # to the final strings sent to the model. Passing the text override
-        # implies the toggle.
-        _bg_on = bool(add_background) or bool(background_text)
-        _bg_text = (background_text or video_cfg.default_background).strip() if _bg_on else ""
+        # Background is always pre-filled in the report — `--background` (any
+        # value, including "") overrides the config default for this run. The
+        # cell value is the source of truth at execute time; clear it per-row
+        # to disable scene replacement for that SKU.
+        if background_text is not None:
+            _bg_text = background_text.strip()
+        else:
+            _bg_text = (video_cfg.default_background or "").strip()
+
+        # Audio still uses the explicit toggle since most product videos
+        # don't want music by default. --add-audio populates with the config
+        # default; --audio "..." overrides the text and implies the toggle.
         _audio_on = bool(add_audio) or bool(audio_text)
         _audio_text = (audio_text or video_cfg.default_audio).strip() if _audio_on else ""
 
         # Both features need Seedance 2.0+. Fail fast before any Drive/Sheets work.
         any_v2 = any(m.strip().lower().startswith("bytedance/seedance-2") for m in _models)
-        if (_bg_on or _audio_on) and not any_v2:
+        if (_bg_text or _audio_text) and not any_v2:
             offenders = []
-            if _bg_on:
-                offenders.append("--add-background / --background")
-            if _audio_on:
+            if _bg_text:
+                offenders.append(f"--background ({_bg_text!r})")
+            if _audio_text:
                 offenders.append("--add-audio / --audio")
             raise typer.BadParameter(
                 f"{', '.join(offenders)} require a Seedance 2.0+ model. "
-                f"Configured: {_models}. Set --models bytedance/seedance-2.0 or "
-                "update generate.video.models in pipeline.config.toml."
+                f"Configured: {_models}. Set --models bytedance/seedance-2.0, "
+                "update generate.video.models in pipeline.config.toml, or pass "
+                "--background '' to disable scene replacement for this run."
+            )
+
+        # Resolve --add-logo-card / --logo-id (the text-override pattern).
+        # The logo Drive ID can come from --logo-id, the config, or be
+        # absent. Passing --logo-id implies --add-logo-card.
+        _logo_on = bool(add_logo_card) or bool(logo_id)
+        _logo_id = (logo_id or video_cfg.logo_drive_id or "").strip()
+        if _logo_on and not _logo_id:
+            raise typer.BadParameter(
+                "--add-logo-card needs a Drive file ID. Set --logo-id <ID> or "
+                "configure generate.video.logo_drive_id in pipeline.config.toml."
             )
 
         _cost_per = video_cfg.cost_for(_models[0])
@@ -1505,8 +1559,10 @@ def generate(
                 photos_subdir=photos_subdir,
                 videos_subdir=videos_subdir,
                 cost_per_video_usd=_cost_per,
+                name_col=cfg.csv.name_column,
                 default_background=_bg_text,
                 default_audio=_audio_text,
+                default_prompt=video_cfg.default_prompt,
                 sku_filter=sku_filter_norm,
             )
             progress.update(t, description=f"Built plan: {len(plans)} entries")
@@ -1540,16 +1596,26 @@ def generate(
                 f"{counts['skipped']} skipped."
             )
             console.print(
-                f"\nReview '{_report_tab}' (per-SKU edits override CLI defaults):"
-                f"\n  • Action=SKIP   → skip that row"
+                f"\nReview '{_report_tab}' — every cell is pre-filled with the run's"
+                f" defaults; per-row edits in the sheet win at execute time."
+                f"\n  • Action=SKIP   → skip that row (SKIP rows are also pre-filled so"
+                f"\n                    you can flip Action=GENERATE to opt them in)."
                 f"\n  • Source Photos → comma-separated filenames. Order matters:"
                 f"\n                    first = start frame, last = end frame (keyframe"
                 f"\n                    mode); up to {video_cfg.max_reference_images}"
-                f" used in reference mode. Leave"
-                f"\n                    untouched to use Drive's full set."
-                f"\n  • Background    → scene description. Non-empty switches that SKU"
-                f"\n                    into reference-images mode (Seedance 2.0+)."
-                f"\n  • Audio         → audio style. Non-empty enables Seedance 2.0+ music."
+                f" used in reference mode."
+                f"\n  • Title         → opening text overlay (pre-filled from `name`)."
+                f"\n                    Used when --add-title-card is passed; clear to"
+                f"\n                    suppress for one row."
+                f"\n  • Background    → scene description, pre-filled with the run default."
+                f"\n                    Non-empty → reference-images mode (Seedance 2.0+);"
+                f"\n                    clear the cell to keep that SKU on a white studio."
+                f"\n  • Audio         → audio style (only populated when --add-audio is"
+                f"\n                    passed). Non-empty enables Seedance 2.0+ music."
+                f"\n  • Prompt        → motion/style block, pre-filled with the configured"
+                f"\n                    default. Edit per-row to fix model artifacts (e.g."
+                f"\n                    'extra leg' on a chair) — your text replaces the"
+                f"\n                    default for that SKU. Clear the cell to fall back."
                 f"\nThen re-run with --execute (and --budget to set a hard cost cap)."
             )
             return
@@ -1589,6 +1655,12 @@ def generate(
                     p.source_photos = names
             p.background = (r.get("Background") or "").strip()
             p.audio = (r.get("Audio") or "").strip()
+            # Per-row overrides for the title text and prompt. Edits in the
+            # sheet take precedence over the plan-time defaults.
+            if "Title" in r:
+                p.title = (r.get("Title") or "").strip()
+            if "Prompt" in r:
+                p.prompt_override = (r.get("Prompt") or "").strip()
         runnable = [p for p in plans if p.action == "GENERATE" and p.sku in actionable_skus]
 
         runnable_worst_cost = round(len(runnable) * _worst_per_video, 4)
@@ -1608,14 +1680,48 @@ def generate(
             console.print("Set Action=SKIP on rows you don't want, lower --max-retries, or raise --budget.")
             raise typer.Exit(1)
 
+        # Download the company logo once per run (used in the closing card
+        # for every SKU). Stored in a tempdir that lives for the run.
+        _logo_local_path = ""
+        if _logo_on:
+            import tempfile as _tempfile
+            from asset_sdk.adapters import drive as _drive
+            _logo_dir = _tempfile.mkdtemp(prefix="genvideo_logo_")
+            try:
+                # Try to preserve the original extension so PIL detects format
+                # correctly. find_or_create_folder etc don't apply here — we
+                # just need the file bytes.
+                _logo_local_path = os.path.join(_logo_dir, "logo")
+                _drive.download_file(_logo_id, _logo_local_path)
+            except Exception as exc:
+                raise typer.BadParameter(
+                    f"could not download logo file (id={_logo_id!r}): {exc}"
+                )
+            console.print(f"[dim]Logo downloaded → {_logo_local_path}[/dim]")
+
         with_bg = sum(1 for p in runnable if p.background.strip())
         with_audio = sum(1 for p in runnable if p.audio.strip())
+        with_title = sum(1 for p in runnable if (p.title or "").strip()) if add_title_card else 0
+        # Final clip length is seedance duration + any bookend overlays we'll
+        # prepend / append; surface it so the user sees what they'll get.
+        bookend_seconds = (
+            (video_cfg.title_card_seconds if add_title_card else 0.0)
+            + (video_cfg.logo_card_seconds if _logo_on else 0.0)
+        )
+        total_seconds = video_cfg.duration_seconds + bookend_seconds
+        cards_label = []
+        if add_title_card:
+            cards_label.append(f"title={with_title}/{len(runnable)}")
+        if _logo_on:
+            cards_label.append("logo=all")
         console.print(
             f"[bold]Running[/bold] {len(runnable)} video generations "
             f"(~${runnable_best_cost:.2f}–${runnable_worst_cost:.2f}, "
             f"models={' → '.join(_models)}, retries={_max_retries}, "
-            f"{video_cfg.duration_seconds}s @ {video_cfg.resolution}, "
-            f"bg-rows={with_bg}/{len(runnable)}, audio-rows={with_audio}/{len(runnable)})."
+            f"seedance={video_cfg.duration_seconds}s → final={total_seconds:.1f}s "
+            f"@ {video_cfg.resolution}, "
+            f"bg-rows={with_bg}/{len(runnable)}, audio-rows={with_audio}/{len(runnable)}"
+            f"{', ' + ', '.join(cards_label) if cards_label else ''})."
         )
 
         generated = errored = skipped = 0
@@ -1634,6 +1740,12 @@ def generate(
             camera_fixed=video_cfg.camera_fixed,
             use_last_frame=video_cfg.use_last_frame,
             max_reference_images=video_cfg.max_reference_images,
+            add_title_card=add_title_card,
+            logo_local_path=_logo_local_path,
+            title_card_seconds=video_cfg.title_card_seconds,
+            logo_card_seconds=video_cfg.logo_card_seconds,
+            title_font_path=video_cfg.title_font_path,
+            card_text_color=video_cfg.card_text_color,
             max_retries=_max_retries,
             debug=debug,
             logger=console.print,

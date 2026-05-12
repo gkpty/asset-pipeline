@@ -26,6 +26,7 @@ dependencies = [
     "anthropic>=0.40",
     "google-genai>=0.5",
     "replicate>=0.30",
+    "imageio-ffmpeg>=0.4",
 ]
 
 [build-system]

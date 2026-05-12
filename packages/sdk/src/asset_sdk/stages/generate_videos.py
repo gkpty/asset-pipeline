@@ -20,8 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path as _Path
 from typing import Generator, NamedTuple
 
+import re
+import subprocess
+
 import numpy as np
-from PIL import Image as _PILImage
+from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont as _PILFont
 
 from asset_sdk.adapters import drive
 
@@ -29,6 +32,15 @@ from asset_sdk.adapters import drive
 # from product silhouettes (not macro / detail shots).
 _PRODUCT_WHITE_PCT = 0.20
 _NEAR_WHITE_THRESHOLD = 245
+
+# Font candidates probed when title_font_path is unset. First match wins.
+_SYSTEM_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+]
 
 
 @dataclass
@@ -49,6 +61,15 @@ class VideoPlan:
     # style (Seedance 2.0+). Empty → silent video. Pre-filled from the CLI
     # default; editable per-row in the report.
     audio: str = ""
+    # Title text shown on the opening title card. Pre-filled from the
+    # sheet's `name` column at plan time; editable per-row. Empty (or
+    # title cards disabled) → no opening card for this SKU.
+    title: str = ""
+    # Per-SKU prompt override. Non-empty → replaces the default motion /
+    # style block entirely for this row. Useful for products where the
+    # generic prompt produces artifacts ("extra leg", "merged surfaces")
+    # and you need more specific guidance.
+    prompt_override: str = ""
     cost_usd: float = 0.0
     action: str = "SKIP"            # GENERATE | SKIP
     notes: str = ""
@@ -116,8 +137,10 @@ def build_plan(
     photos_subdir: str,
     videos_subdir: str,
     cost_per_video_usd: float,
+    name_col: str = "",
     default_background: str = "",
     default_audio: str = "",
+    default_prompt: str = "",
     sku_filter: str | None = None,
 ) -> list[VideoPlan]:
     """One VideoPlan per SKU in the sheet.
@@ -139,42 +162,64 @@ def build_plan(
         if sku_filter is not None and sku != sku_filter:
             continue
 
+        # Pre-compute everything we can fill on a row, including SKIP rows
+        # — so the report always shows defaults that the user can edit. A
+        # SKIP row the user wants to run becomes a GENERATE with one flip
+        # of the Action cell.
+        product_name = (row.get(name_col) or "").strip() if name_col else ""
+
+        def _new_plan(
+            *, supplier: str, action: str, notes: str,
+            photos_list: list[dict] | None = None, cost: float = 0.0,
+        ) -> VideoPlan:
+            return VideoPlan(
+                sku=sku, supplier=supplier, parent_product=parent,
+                source_photos=[p["name"] for p in (photos_list or [])],
+                background=default_background,
+                audio=default_audio,
+                title=product_name,
+                prompt_override=default_prompt,
+                cost_usd=cost,
+                action=action,
+                notes=notes,
+            )
+
         if sku not in sku_index:
-            plans.append(VideoPlan(
-                sku=sku, supplier=sup, parent_product=parent,
-                action="SKIP", notes="sku folder not found in Drive",
+            plans.append(_new_plan(
+                supplier=sup, action="SKIP",
+                notes="sku folder not found in Drive",
             ))
             continue
 
         target_sup, target_sku_id = sku_index[sku]
 
-        if _list_videos(target_sku_id, videos_subdir):
-            plans.append(VideoPlan(
-                sku=sku, supplier=target_sup, parent_product=parent,
-                action="SKIP", notes="target already has a video",
-            ))
-            continue
-
+        # List photos eagerly so SKIP rows that DO have photos still show
+        # them in the report (useful when flipping to GENERATE).
         photos = _list_photos(target_sku_id, photos_subdir)
-        if not photos:
-            plans.append(VideoPlan(
-                sku=sku, supplier=target_sup, parent_product=parent,
-                action="SKIP", notes="no photos to seed from",
+
+        if _list_videos(target_sku_id, videos_subdir):
+            plans.append(_new_plan(
+                supplier=target_sup, action="SKIP",
+                notes="target already has a video", photos_list=photos,
             ))
             continue
 
-        # List ALL photo filenames so the user can edit the cell before
-        # --execute to keep only the reference shots they want. The order in
-        # the cell is preserved at execute time — for keyframe mode, the
-        # first entry becomes the first frame and the last entry becomes
-        # the last frame.
-        plans.append(VideoPlan(
-            sku=sku, supplier=target_sup, parent_product=parent,
-            source_photos=[p["name"] for p in photos],
-            background=default_background,
-            audio=default_audio,
-            cost_usd=round(float(cost_per_video_usd), 4),
-            action="GENERATE",
+        if not photos:
+            plans.append(_new_plan(
+                supplier=target_sup, action="SKIP",
+                notes="no photos to seed from",
+            ))
+            continue
+
+        # GENERATE: list ALL photo filenames so the user can edit the cell
+        # before --execute to keep only the reference shots they want. The
+        # order in the cell is preserved at execute time — for keyframe
+        # mode, the first entry is the first frame, the last is the last.
+        plans.append(_new_plan(
+            supplier=target_sup, action="GENERATE",
+            notes="",
+            photos_list=photos,
+            cost=round(float(cost_per_video_usd), 4),
         ))
 
     return plans
@@ -187,14 +232,14 @@ def to_sheet_rows(plans: list[VideoPlan]) -> tuple[list[str], list[list]]:
     sorted_plans = sorted(plans, key=lambda p: (_ACTION_ORDER.get(p.action, 99), p.sku))
     headers = [
         "SKU", "Supplier", "Parent Product", "Source Photos",
-        "Background", "Audio",
+        "Title", "Background", "Audio", "Prompt",
         "Cost USD", "Action", "Notes",
     ]
     rows: list[list] = []
     for p in sorted_plans:
         rows.append([
             p.sku, p.supplier, p.parent_product, ", ".join(p.source_photos),
-            p.background, p.audio,
+            p.title, p.background, p.audio, p.prompt_override,
             f"{p.cost_usd:.4f}", p.action, p.notes,
         ])
     return headers, rows
@@ -253,10 +298,14 @@ def build_prompt(
             "and reflections / occlusion that match the environment."
         )
         parts.append(
-            f"The {pp} rotates slowly in place on its vertical axis — a gentle turntable "
-            "motion. The camera is completely locked and static: no pan, no tilt, no "
-            "dolly, no zoom, no orbit. Only the product's rotation moves; the environment "
-            "and the camera stay perfectly still."
+            f"The camera makes a slow, smooth push-in toward the {pp} with a very "
+            "gentle frame shift — subtle, elegant motion only. The product itself is "
+            f"completely static: the {pp} does not rotate, tilt, lift, deform, or "
+            "change pose; only the camera moves. Every part of the product — its "
+            "geometry, topology, part count, silhouette, and details — is identical "
+            "in every frame; nothing is added, duplicated, split, or hallucinated. "
+            "The scene around the product stays completely constant: same composition, "
+            "same lighting, same shadows, same surfaces."
         )
         parts.append("Photorealistic. No text, watermarks, logos, captions, or overlays.")
     else:
@@ -395,6 +444,302 @@ def _letterbox_to_aspect(local_path: str, target_aspect: str, out_path: str) -> 
         return out_path
     except Exception:
         return local_path
+
+
+# ---------------------------------------------------------------------------
+# Title + logo overlays (via bundled ffmpeg from imageio-ffmpeg)
+# ---------------------------------------------------------------------------
+
+def _ffmpeg_exe() -> str:
+    """Resolve the ffmpeg binary path. Falls back to the imageio-ffmpeg-
+    bundled binary when ffmpeg isn't on PATH — keeps card rendering working
+    without `brew install ffmpeg`."""
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _probe_video_dimensions(path: str) -> tuple[int, int]:
+    """Parse `width x height` out of ffmpeg's stderr for a video file. ffmpeg
+    always prints the stream metadata at startup, so we run it with no output
+    and scrape stderr. Cheaper than depending on ffprobe (not bundled)."""
+    out = subprocess.run(
+        [_ffmpeg_exe(), "-i", path],
+        capture_output=True, text=True,
+    )
+    m = re.search(r"Stream #\d+:\d+.*?Video.*?,\s*(\d{2,5})x(\d{2,5})", out.stderr, re.S)
+    if not m:
+        raise RuntimeError(f"could not probe dimensions of {path}: ffmpeg gave no Stream line")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _probe_video_duration(path: str) -> float:
+    """Parse the `Duration: HH:MM:SS.ff` line out of ffmpeg's stderr."""
+    out = subprocess.run(
+        [_ffmpeg_exe(), "-i", path],
+        capture_output=True, text=True,
+    )
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", out.stderr)
+    if not m:
+        raise RuntimeError(f"could not probe duration of {path}")
+    h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    return h * 3600 + mn * 60 + s
+
+
+def _has_audio_stream(path: str) -> bool:
+    """ffmpeg's stderr prints one `Stream #x:y(...): Audio: ...` line per audio track."""
+    out = subprocess.run(
+        [_ffmpeg_exe(), "-i", path],
+        capture_output=True, text=True,
+    )
+    return bool(re.search(r"Stream #\d+:\d+.*?:\s*Audio:", out.stderr))
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _find_font(configured: str) -> str | None:
+    if configured and os.path.isfile(configured):
+        return configured
+    for p in _SYSTEM_FONT_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _fit_font(
+    text: str, font_path: str | None, max_w: int, max_h: int,
+) -> _PILFont.FreeTypeFont:
+    """Binary-search the largest font size whose bbox fits inside the budget."""
+    if not font_path:
+        return _PILFont.load_default()
+    lo, hi = 16, min(max_w, max_h)
+    best: _PILFont.FreeTypeFont = _PILFont.truetype(font_path, lo)
+    tmp = _PILImage.new("RGB", (1, 1))
+    draw = _PILDraw.Draw(tmp)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            f = _PILFont.truetype(font_path, mid)
+        except OSError:
+            break
+        bbox = draw.textbbox((0, 0), text, font=f)
+        if (bbox[2] - bbox[0]) <= max_w and (bbox[3] - bbox[1]) <= max_h:
+            best = f
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _render_title_overlay_png(
+    text: str, width: int, height: int, *,
+    text_color: str, font_path: str | None,
+    out_path: str,
+) -> None:
+    """Render the title TEXT only (transparent background) at video
+    dimensions, anchored bottom-center. A subtle white outline keeps the
+    text legible on varied first-frame backgrounds."""
+    canvas = _PILImage.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = _PILDraw.Draw(canvas)
+    # Text budget: 84% of width, 14% of height. Roomy for long names.
+    max_w = int(width * 0.84)
+    max_h = int(height * 0.14)
+    font = _fit_font(text, font_path, max_w, max_h)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (width - tw) // 2 - bbox[0]
+    # Baseline 88% down from the top — keeps clear of the bottom safe-area
+    # without crowding the product.
+    y = int(height * 0.88) - th - bbox[1]
+    font_size = getattr(font, "size", 32)
+    stroke_w = max(2, int(font_size * 0.04))
+    draw.text(
+        (x, y), text,
+        fill=_hex_to_rgb(text_color),
+        font=font,
+        stroke_width=stroke_w,
+        stroke_fill=(255, 255, 255, 200),
+    )
+    canvas.save(out_path, "PNG")
+
+
+def _render_logo_overlay_png(
+    logo_path: str, width: int, height: int, *, out_path: str,
+) -> None:
+    """Render the LOGO only (transparent background) at video dimensions,
+    centered, fit to ~50% of the shorter edge — matches the previous
+    end-card framing the user said worked well."""
+    canvas = _PILImage.new("RGBA", (width, height), (0, 0, 0, 0))
+    with _PILImage.open(logo_path) as logo_raw:
+        logo = logo_raw.convert("RGBA")
+        budget = int(min(width, height) * 0.5)
+        logo.thumbnail((budget, budget), _PILImage.LANCZOS)
+        px = (width - logo.width) // 2
+        py = (height - logo.height) // 2
+        canvas.paste(logo, (px, py), logo)
+    canvas.save(out_path, "PNG")
+
+
+def _extract_frame(video_path: str, *, when: str, out_path: str) -> None:
+    """Pull one frame out of a video as a high-quality PNG.
+
+    `when` is "first" (frame at t=0) or "last" (a frame just before EOF).
+    For "last" we probe the duration and use OUTPUT-seek (`-ss` after `-i`)
+    instead of `-sseof`: tested with the bundled ffmpeg on real Seedance
+    MP4s, `-sseof` silently produces no frame on some clips while ffmpeg
+    still exits 0. Output-seek reads from the start (negligible for a 6s
+    clip) and is frame-accurate."""
+    cmd = [_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", video_path]
+    if when == "last":
+        duration = _probe_video_duration(video_path)
+        # Seek 100ms before EOF so we land on a real frame even if the
+        # very last sample is short.
+        seek_to = max(0.0, duration - 0.1)
+        cmd += ["-ss", f"{seek_to:.3f}"]
+    cmd += ["-frames:v", "1", "-q:v", "1", out_path]
+    result = subprocess.run(cmd, capture_output=True)
+    if (
+        result.returncode != 0
+        or not os.path.isfile(out_path)
+        or os.path.getsize(out_path) == 0
+    ):
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace")[:400]
+        raise RuntimeError(
+            f"frame extraction failed ({when}) for {video_path}: "
+            f"returncode={result.returncode}, stderr={stderr!r}"
+        )
+
+
+def _build_bookend_clip(
+    *,
+    still_frame_path: str,
+    overlay_png: str,
+    fade_kind: str,           # "in" or "out"
+    duration: float,
+    with_audio: bool,
+    out_path: str,
+) -> None:
+    """Build a `duration`-second mp4 of a still frame with a transparent
+    overlay composited on top, animated with an alpha fade.
+
+    `fade_kind="out"` → overlay starts fully visible, fades to invisible
+    (used for the title intro at the start of the final video).
+    `fade_kind="in"`  → overlay starts invisible, fades to fully visible
+    (used for the logo outro at the end of the final video).
+
+    A silent stereo AAC track is added when `with_audio=True` so this clip
+    can be concat'd cleanly with audio-bearing seedance output."""
+    cmd: list[str] = [
+        _ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-loop", "1", "-t", f"{duration:.3f}", "-i", still_frame_path,
+        "-loop", "1", "-t", f"{duration:.3f}", "-i", overlay_png,
+    ]
+    if with_audio:
+        cmd += ["-f", "lavfi", "-t", f"{duration:.3f}", "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=44100"]
+    cmd += [
+        "-filter_complex",
+        f"[1:v]format=rgba,fade=t={fade_kind}:st=0:d={duration:.3f}:alpha=1[fx];"
+        f"[0:v][fx]overlay=x=0:y=0:format=auto[outv]",
+        "-map", "[outv]",
+    ]
+    if with_audio:
+        cmd += ["-map", "2:a", "-c:a", "aac"]
+    cmd += [
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _concat_clips(
+    clip_paths: list[str], output_path: str, *, with_audio: bool,
+) -> None:
+    """Concatenate clips with ffmpeg's concat filter (re-encodes; safe
+    across container / codec differences). Emits H.264 + AAC when audio."""
+    cmd: list[str] = [_ffmpeg_exe(), "-y", "-loglevel", "error"]
+    for p in clip_paths:
+        cmd += ["-i", p]
+    n = len(clip_paths)
+    if with_audio:
+        streams = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
+        filter_str = f"{streams}concat=n={n}:v=1:a=1[outv][outa]"
+        cmd += ["-filter_complex", filter_str, "-map", "[outv]", "-map", "[outa]"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]
+    else:
+        streams = "".join(f"[{i}:v:0]" for i in range(n))
+        filter_str = f"{streams}concat=n={n}:v=1:a=0[outv]"
+        cmd += ["-filter_complex", filter_str, "-map", "[outv]"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    cmd += [output_path]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _apply_bookend_overlays(
+    seedance_path: str,
+    *,
+    title_png: str | None,
+    title_seconds: float,
+    logo_png: str | None,
+    logo_seconds: float,
+    tmp_dir: _Path,
+    output_path: str,
+) -> None:
+    """Build the final mp4 = [title intro] + seedance + [logo outro].
+
+    The intro is the seedance's first frame held for `title_seconds` with
+    the title overlay fading OUT (so the title reads at t=0 and clears
+    naturally before the product motion starts).
+
+    The outro is the seedance's last frame held for `logo_seconds` with
+    the logo overlay fading IN (logo arrives smoothly on the same pose
+    the product video ends on, then sits at full opacity until the cut).
+
+    Either bookend can be skipped by passing the corresponding *_png as
+    None. Raises if both are None — caller should just upload seedance
+    directly in that case."""
+    if not title_png and not logo_png:
+        raise RuntimeError("_apply_bookend_overlays called with no overlays")
+
+    with_audio = _has_audio_stream(seedance_path)
+    clips: list[str] = []
+
+    if title_png:
+        first_frame = str(tmp_dir / "_first_frame.png")
+        _extract_frame(seedance_path, when="first", out_path=first_frame)
+        title_intro = str(tmp_dir / "_title_intro.mp4")
+        _build_bookend_clip(
+            still_frame_path=first_frame,
+            overlay_png=title_png,
+            fade_kind="out",
+            duration=title_seconds,
+            with_audio=with_audio,
+            out_path=title_intro,
+        )
+        clips.append(title_intro)
+
+    clips.append(seedance_path)
+
+    if logo_png:
+        last_frame = str(tmp_dir / "_last_frame.png")
+        _extract_frame(seedance_path, when="last", out_path=last_frame)
+        logo_outro = str(tmp_dir / "_logo_outro.mp4")
+        _build_bookend_clip(
+            still_frame_path=last_frame,
+            overlay_png=logo_png,
+            fade_kind="in",
+            duration=logo_seconds,
+            with_audio=with_audio,
+            out_path=logo_outro,
+        )
+        clips.append(logo_outro)
+
+    _concat_clips(clips, output_path, with_audio=with_audio)
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +885,12 @@ def execute(
     camera_fixed: bool = True,
     use_last_frame: bool = True,
     max_reference_images: int = 9,
+    add_title_card: bool = False,
+    logo_local_path: str = "",
+    title_card_seconds: float = 1.5,
+    logo_card_seconds: float = 1.5,
+    title_font_path: str = "",
+    card_text_color: str = "#111111",
     max_retries: int = 1,
     debug: bool = False,
     logger=print,
@@ -664,8 +1015,16 @@ def execute(
                     logger(f"  last frame:  {tail_name}")
                 else:
                     logger("  last frame:  (none — single-frame mode)")
+            # Per-SKU prompt override (from the report's Prompt column)
+            # replaces the configured default motion/style block. Useful for
+            # products that need more specific guidance to avoid artifacts
+            # (e.g. "extra leg" on a chair) — the user writes a tighter
+            # prompt in the sheet for just that row.
+            effective_default_prompt = (
+                plan.prompt_override.strip() or default_prompt
+            )
             prompt = build_prompt(
-                plan.parent_product, default_prompt, extra_prompt,
+                plan.parent_product, effective_default_prompt, extra_prompt,
                 background=sku_background, audio=sku_audio,
                 reference_count=len(ref_local_paths),
             )
@@ -739,9 +1098,77 @@ def execute(
             if video_bytes is None:
                 continue
 
-            local_mp4 = str(tmp_path / out_name)
-            with open(local_mp4, "wb") as fh:
+            seedance_path = str(tmp_path / f"_seedance_{out_name}")
+            with open(seedance_path, "wb") as fh:
                 fh.write(video_bytes)
+
+            # Title / logo bookend cards. Either, both, or neither — the
+            # final upload path is whatever came out the other end of the
+            # pipeline.
+            sku_title = (plan.title or "").strip() if add_title_card else ""
+            apply_title = bool(sku_title)
+            apply_logo = bool(logo_local_path) and os.path.isfile(logo_local_path)
+
+            local_mp4 = str(tmp_path / out_name)
+            if apply_title or apply_logo:
+                try:
+                    # Render overlay PNGs at the actual video dimensions so
+                    # the alpha composite is pixel-aligned.
+                    width, height = _probe_video_dimensions(seedance_path)
+                    title_png_path: str | None = None
+                    if apply_title:
+                        title_png_path = str(tmp_path / "_title_overlay.png")
+                        _render_title_overlay_png(
+                            sku_title, width, height,
+                            text_color=card_text_color,
+                            font_path=_find_font(title_font_path),
+                            out_path=title_png_path,
+                        )
+                    logo_png_path: str | None = None
+                    if apply_logo:
+                        logo_png_path = str(tmp_path / "_logo_overlay.png")
+                        _render_logo_overlay_png(
+                            logo_local_path, width, height,
+                            out_path=logo_png_path,
+                        )
+                    _apply_bookend_overlays(
+                        seedance_path,
+                        title_png=title_png_path,
+                        title_seconds=title_card_seconds,
+                        logo_png=logo_png_path,
+                        logo_seconds=logo_card_seconds,
+                        tmp_dir=tmp_path,
+                        output_path=local_mp4,
+                    )
+                    parts = []
+                    if apply_title:
+                        parts.append(
+                            f"title intro {title_card_seconds:.1f}s (first frame + text, fade-out)"
+                        )
+                    if apply_logo:
+                        parts.append(
+                            f"logo outro {logo_card_seconds:.1f}s (last frame + logo, fade-in)"
+                        )
+                    logger(f"  ✓ bookend overlays added ({', '.join(parts)})")
+                except subprocess.CalledProcessError as exc:
+                    stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[:300]
+                    logger(f"  ✗ ffmpeg failed: {stderr}")
+                    yield GenProgress(
+                        sku=plan.sku, output_name=out_name, skipped=False,
+                        error=f"ffmpeg failed while building bookend overlays: {stderr}",
+                    )
+                    continue
+                except Exception as exc:
+                    logger(f"  ✗ bookend render failed: {exc}")
+                    yield GenProgress(
+                        sku=plan.sku, output_name=out_name, skipped=False,
+                        error=f"bookend render failed: {exc}",
+                    )
+                    continue
+            else:
+                # No overlays requested — promote the raw Seedance output
+                # to the final upload path.
+                os.rename(seedance_path, local_mp4)
 
             try:
                 if debug:
@@ -757,5 +1184,53 @@ def execute(
                 yield GenProgress(sku=plan.sku, output_name=out_name, skipped=False,
                                   error=f"upload failed: {exc}")
                 continue
+
+            # ----- Debug artifacts -----
+            # When --debug is on, upload every intermediate that ffmpeg + the
+            # render stage produced so the user can A/B against the final.
+            # Missing files (e.g. logo overlay when --add-logo-card is off)
+            # are silently skipped. Prior debug files of the same name are
+            # trashed so re-runs stay clean.
+            if debug:
+                try:
+                    debug_folder_id = drive.find_or_create_folder("_debug", videos_folder_id)
+                    artifacts = [
+                        # Raw Seedance output — the most useful one: lets you
+                        # see what came back from the API before ffmpeg touched it.
+                        (str(tmp_path / f"_seedance_{out_name}"),
+                         f"{plan.sku}_seedance.mp4", "video/mp4"),
+                        # Overlay PNGs (transparent canvases).
+                        (str(tmp_path / "_title_overlay.png"),
+                         "_title.png", "image/png"),
+                        (str(tmp_path / "_logo_overlay.png"),
+                         "_logo.png", "image/png"),
+                        # Extracted bookend stills.
+                        (str(tmp_path / "_first_frame.png"),
+                         "_first_frame.png", "image/png"),
+                        (str(tmp_path / "_last_frame.png"),
+                         "_last_frame.png", "image/png"),
+                        # Composited 1s bookend clips.
+                        (str(tmp_path / "_title_intro.mp4"),
+                         "_title_intro.mp4", "video/mp4"),
+                        (str(tmp_path / "_logo_outro.mp4"),
+                         "_logo_outro.mp4", "video/mp4"),
+                    ]
+                    # Clear prior debug files of names we'd be overwriting.
+                    known_names = {name for (_, name, _) in artifacts}
+                    for f in drive.list_files(debug_folder_id):
+                        if f["name"] in known_names:
+                            drive.trash_item(f["id"])
+                    uploaded = 0
+                    for local, drive_name, mime in artifacts:
+                        if os.path.isfile(local) and os.path.getsize(local) > 0:
+                            try:
+                                drive.upload_file(local, debug_folder_id, drive_name, mime)
+                                uploaded += 1
+                            except Exception as exc:
+                                logger(f"  [debug] upload failed for {drive_name}: {exc}")
+                    if uploaded:
+                        logger(f"  [debug] {uploaded} artifact(s) → _debug/")
+                except Exception as exc:
+                    logger(f"  [debug] could not upload debug folder: {exc}")
 
             yield GenProgress(sku=plan.sku, output_name=out_name, skipped=False)
