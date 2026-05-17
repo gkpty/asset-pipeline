@@ -75,6 +75,11 @@ class VideoPlan:
     # generic prompt produces artifacts ("extra leg", "merged surfaces")
     # and you need more specific guidance.
     prompt_override: str = ""
+    # Per-SKU clip duration in seconds. Pre-filled with the configured
+    # default at plan time; --analyze-motion can rewrite it based on what
+    # Claude sees in the photos (more rotation = longer clip). Editable
+    # per-row in the report. Clamped to [5, 20] at every entry point.
+    duration_seconds: int = 0
     cost_usd: float = 0.0
     action: str = "SKIP"            # GENERATE | SKIP
     notes: str = ""
@@ -131,6 +136,21 @@ def _list_videos(sku_id: str, videos_subdir: str) -> list[dict]:
 # build_plan
 # ---------------------------------------------------------------------------
 
+DURATION_MIN_SECONDS = 5
+DURATION_MAX_SECONDS = 20
+
+
+def _clamp_duration(value: int | float | None, fallback: int) -> int:
+    """Coerce any user / Claude / sheet input into a sane integer in the
+    [DURATION_MIN_SECONDS, DURATION_MAX_SECONDS] band. Returns `fallback`
+    if the input can't be parsed (also clamped)."""
+    try:
+        v = int(round(float(value)))  # accept "8", "8.0", 8, 8.5
+    except (TypeError, ValueError):
+        v = int(fallback)
+    return max(DURATION_MIN_SECONDS, min(DURATION_MAX_SECONDS, v))
+
+
 def build_plan(
     *,
     category_folder_id: str,
@@ -146,7 +166,9 @@ def build_plan(
     default_background: str = "",
     default_audio: str = "",
     default_prompt: str = "",
+    default_duration: int = 8,
     sku_filter: str | None = None,
+    supplier_filter: str | None = None,
 ) -> list[VideoPlan]:
     """One VideoPlan per SKU in the sheet.
 
@@ -158,6 +180,8 @@ def build_plan(
     sku_index = _build_sku_index(category_folder_id, structure)
     plans: list[VideoPlan] = []
 
+    sup_filter_lower = supplier_filter.strip().lower() if supplier_filter else None
+
     for row in sheet_rows:
         sku = (row.get(sku_col) or "").strip()
         sup = (row.get(supplier_col) or "").strip()
@@ -166,12 +190,15 @@ def build_plan(
             continue
         if sku_filter is not None and sku != sku_filter:
             continue
+        if sup_filter_lower is not None and sup.lower() != sup_filter_lower:
+            continue
 
         # Pre-compute everything we can fill on a row, including SKIP rows
         # — so the report always shows defaults that the user can edit. A
         # SKIP row the user wants to run becomes a GENERATE with one flip
         # of the Action cell.
         product_name = (row.get(name_col) or "").strip() if name_col else ""
+        clamped_default_duration = _clamp_duration(default_duration, fallback=8)
 
         def _new_plan(
             *, supplier: str, action: str, notes: str,
@@ -184,6 +211,7 @@ def build_plan(
                 audio=default_audio,
                 title=product_name,
                 prompt_override=default_prompt,
+                duration_seconds=clamped_default_duration,
                 cost_usd=cost,
                 action=action,
                 notes=notes,
@@ -236,7 +264,7 @@ def analyze_motion_for_plans(
     category_folder_id: str,
     structure: str,
     photos_subdir: str,
-    duration_seconds: int,
+    fallback_duration: int,
     default_prompt: str = "",
     motion_model: str = "claude-sonnet-4-6",
     max_photos_per_sku: int = 9,
@@ -305,11 +333,11 @@ def analyze_motion_for_plans(
                     return analyzed  # bail — no point trying further SKUs
 
             try:
-                motion = _suggest_camera_motion(
+                suggestion = _suggest_motion_and_duration(
                     client,
                     parent_product=plan.parent_product,
                     photo_paths=paths,
-                    duration_seconds=duration_seconds,
+                    fallback_duration=fallback_duration,
                     model=motion_model,
                 )
             except Exception as exc:
@@ -318,10 +346,14 @@ def analyze_motion_for_plans(
                 continue
 
             plan.prompt_override = _build_motion_style_block(
-                plan.parent_product, motion,
+                plan.parent_product, suggestion.motion,
             )
+            plan.duration_seconds = suggestion.duration
             analyzed += 1
-            logger(f"  [motion] {plan.sku}: {motion}")
+            logger(
+                f"  [motion] {plan.sku}: {suggestion.motion} "
+                f"(duration={suggestion.duration}s)"
+            )
 
     if failed:
         logger(f"  [motion] {len(failed)} SKU(s) failed; left with default prompt")
@@ -335,7 +367,7 @@ def to_sheet_rows(plans: list[VideoPlan]) -> tuple[list[str], list[list]]:
     sorted_plans = sorted(plans, key=lambda p: (_ACTION_ORDER.get(p.action, 99), p.sku))
     headers = [
         "SKU", "Supplier", "Parent Product", "Source Photos",
-        "Title", "Background", "Audio", "Prompt",
+        "Title", "Background", "Audio", "Prompt", "Duration",
         "Cost USD", "Action", "Notes",
     ]
     rows: list[list] = []
@@ -343,6 +375,7 @@ def to_sheet_rows(plans: list[VideoPlan]) -> tuple[list[str], list[list]]:
         rows.append([
             p.sku, p.supplier, p.parent_product, ", ".join(p.source_photos),
             p.title, p.background, p.audio, p.prompt_override,
+            p.duration_seconds or "",
             f"{p.cost_usd:.4f}", p.action, p.notes,
         ])
     return headers, rows
@@ -451,6 +484,134 @@ def _is_seedance_v2(model: str) -> bool:
     return model.strip().lower().startswith("bytedance/seedance-2")
 
 
+# Per-model input-field capabilities. Each model on Replicate accepts a
+# different set of input fields — passing an unknown field 422s the call.
+# Schema sources (probed 2026-05-17):
+#   bytedance/seedance-2.0:        image, last_frame_image, reference_images,
+#                                  resolution, aspect_ratio, generate_audio
+#   bytedance/seedance-1-{pro,…}:  image, last_frame_image, resolution,
+#                                  aspect_ratio, camera_fixed
+#   kwaivgi/kling-v2.5-turbo-pro:  start_image, end_image, aspect_ratio,
+#                                  negative_prompt, guidance_scale  (no
+#                                  resolution; v2.5 is fixed-quality)
+#   kwaivgi/kling-v2.1:            start_image, end_image, mode (standard|pro)
+#                                  in place of resolution; no aspect_ratio
+#   google/veo-3.x:                image, last_frame, reference_images,
+#                                  resolution, aspect_ratio, generate_audio,
+#                                  negative_prompt
+#   runwayml/gen4-turbo:           image, aspect_ratio, prompt, duration, seed
+#                                  (no last-frame, no resolution, no flags)
+_MODEL_CAPS: dict[str, dict] = {
+    "bytedance/seedance-2": {
+        "first_frame_key":      "image",
+        "last_frame_key":       "last_frame_image",
+        "reference_images_key": "reference_images",
+        "resolution":           True,
+        "aspect_ratio":         True,
+        "camera_fixed":         False,
+        "generate_audio":       True,
+        "kling_mode":           False,
+    },
+    "bytedance/seedance-1": {
+        "first_frame_key":      "image",
+        "last_frame_key":       "last_frame_image",
+        "reference_images_key": None,
+        "resolution":           True,
+        "aspect_ratio":         True,
+        "camera_fixed":         True,
+        "generate_audio":       False,
+        "kling_mode":           False,
+    },
+    "kwaivgi/kling-v2.5": {
+        "first_frame_key":      "start_image",
+        "last_frame_key":       "end_image",
+        "reference_images_key": None,
+        "resolution":           False,
+        "aspect_ratio":         True,
+        "camera_fixed":         False,
+        "generate_audio":       False,
+        "kling_mode":           False,
+    },
+    "kwaivgi/kling-v2.1": {
+        "first_frame_key":      "start_image",
+        "last_frame_key":       "end_image",
+        "reference_images_key": None,
+        "resolution":           False,
+        "aspect_ratio":         False,
+        "camera_fixed":         False,
+        "generate_audio":       False,
+        "kling_mode":           True,  # mode = standard|pro
+    },
+    "google/veo":  {
+        "first_frame_key":      "image",
+        "last_frame_key":       "last_frame",
+        "reference_images_key": "reference_images",
+        "resolution":           True,
+        "aspect_ratio":         True,
+        "camera_fixed":         False,
+        "generate_audio":       True,
+        "kling_mode":           False,
+    },
+    "runwayml/gen4": {
+        "first_frame_key":      "image",
+        "last_frame_key":       None,
+        "reference_images_key": None,
+        "resolution":           False,
+        "aspect_ratio":         True,
+        "camera_fixed":         False,
+        "generate_audio":       False,
+        "kling_mode":           False,
+    },
+}
+
+# Fall back to Seedance-2.0 caps for unknown slugs — that's our default
+# model, and overshooting with extra fields would 422 less often than
+# undershooting (most models accept more than our minimum set).
+_DEFAULT_CAPS = _MODEL_CAPS["bytedance/seedance-2"]
+
+
+def _caps_for_model(model: str) -> dict:
+    """Look up the input-field capabilities for a model slug. Prefix
+    match against _MODEL_CAPS so e.g. all `kwaivgi/kling-v2.5-*` variants
+    share an entry. Falls back to _DEFAULT_CAPS for unknown slugs."""
+    m = model.strip().lower()
+    # Try longest prefix first so kling-v2.5 wins over a hypothetical
+    # generic "kwaivgi/kling".
+    for prefix in sorted(_MODEL_CAPS.keys(), key=len, reverse=True):
+        if m.startswith(prefix):
+            return _MODEL_CAPS[prefix]
+    return _DEFAULT_CAPS
+
+
+# Per-model accepted duration values (Replicate openapi_schema enums,
+# snapshot 2026-05-16). Models not listed → assume continuous integers
+# (Seedance family). Update when Replicate's schemas change. The keys are
+# slug PREFIXES so e.g. all "kwaivgi/kling-*" variants share an entry.
+_VALID_DURATIONS_BY_MODEL_PREFIX: dict[str, tuple[int, ...]] = {
+    "kwaivgi/kling":      (5, 10),
+    "google/veo":         (4, 6, 8),
+    "runwayml/gen4":      (5, 10),
+}
+
+
+def _coerce_duration_for_model(
+    model: str, requested: int,
+) -> tuple[int, bool]:
+    """Snap `requested` to the nearest duration the model accepts.
+
+    Returns (coerced_value, was_coerced). For models with a continuous
+    integer range (Seedance), this is a no-op. For enum-constrained
+    models (Kling, Veo, Runway), the closest legal value wins — ties
+    break toward the smaller value (gives the user a slightly cheaper
+    run if both neighbors are equidistant)."""
+    m = model.strip().lower()
+    for prefix, allowed in _VALID_DURATIONS_BY_MODEL_PREFIX.items():
+        if m.startswith(prefix):
+            best = min(allowed, key=lambda v: (abs(v - requested), v))
+            return best, best != requested
+    return requested, False
+
+
 def _anthropic_motion_client():
     """Reuse the same Anthropic client builder the photo verifier uses, so
     we share the ANTHROPIC_API_KEY env var contract."""
@@ -485,21 +646,63 @@ def _build_motion_style_block(parent_product: str, camera_motion: str) -> str:
     )
 
 
-def _suggest_camera_motion(
+@dataclass
+class MotionSuggestion:
+    """Claude's per-SKU recommendation. `motion` goes into the seedance
+    prompt verbatim; `duration` is clamped to [DURATION_MIN_SECONDS,
+    DURATION_MAX_SECONDS] before being returned."""
+    motion: str
+    duration: int
+
+
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_motion_response(text: str, fallback_duration: int) -> MotionSuggestion:
+    """Best-effort JSON parse of Claude's structured response. Falls back
+    to using the entire text as `motion` and the configured default
+    duration if the JSON shape is malformed."""
+    import json
+
+    cleaned = text.strip()
+    # Strip markdown fences if present.
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```\w*\n?|\n?```$", "", cleaned, flags=re.MULTILINE)
+        cleaned = cleaned.strip()
+    m = _JSON_OBJECT_RE.search(cleaned)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            motion = str(data.get("motion") or "").strip().strip("`").strip('"').strip()
+            raw_duration = data.get("duration", fallback_duration)
+            duration = _clamp_duration(raw_duration, fallback=fallback_duration)
+            if motion:
+                return MotionSuggestion(motion=motion, duration=duration)
+        except (ValueError, json.JSONDecodeError):
+            pass
+    # Fallback: treat the whole text as the motion string.
+    return MotionSuggestion(
+        motion=cleaned.strip("`").strip('"').strip(),
+        duration=_clamp_duration(fallback_duration, fallback=fallback_duration),
+    )
+
+
+def _suggest_motion_and_duration(
     anthropic_client,
     *,
     parent_product: str,
     photo_paths: list[str],
-    duration_seconds: int,
+    fallback_duration: int,
     model: str = "claude-sonnet-4-6",
     max_photos: int = 9,
-) -> str:
-    """Ask Claude to analyze the available photos and recommend a camera
-    motion that best showcases the product's distinctive angles.
+) -> MotionSuggestion:
+    """Ask Claude to analyze the available photos and recommend BOTH a
+    camera motion that best showcases the product's distinctive angles
+    AND a duration (5–20s) that fits the motion.
 
-    Sends up to `max_photos` images (Sonnet 4.6 handles 9 fine) along with
-    a task prompt. Returns a 1-2 sentence motion description ready to
-    inject as the `camera_motion` field of build_prompt.
+    More rotation / more angles to reveal = longer duration. Simple
+    push-ins fit comfortably in 5–7s. The duration is treated as a
+    soft suggestion — capped at [5, 20] regardless of what Claude says.
 
     Costs ~$0.01-0.02 per call for Sonnet 4.6 with 5-9 images. Skipped
     entirely unless --analyze-motion is passed."""
@@ -512,47 +715,55 @@ def _suggest_camera_motion(
     n = len(selected)
 
     prompt = (
-        f"You are advising on camera motion for a {duration_seconds}-second "
-        f"AI-generated promotional product video of a {pp}. Below are {n} "
-        f"reference photograph(s) of this exact product, taken from various "
-        f"angles.\n\n"
-        f"Your task: recommend a camera motion that best showcases this "
-        f"specific product. The camera will move; the product stays static.\n\n"
+        f"You are advising on camera motion AND clip duration for an "
+        f"AI-generated promotional video of a {pp}. Below are {n} reference "
+        f"photograph(s) of this exact product, taken from various angles.\n\n"
+        f"Your task: recommend (1) a camera motion that best showcases this "
+        f"specific product's distinctive angles, AND (2) a duration in "
+        f"seconds that fits that motion. The camera will move; the product "
+        f"stays static.\n\n"
         f"Hard constraints:\n"
-        f"- Motion must be subtle, smooth, and short — it has to fit naturally "
-        f"in {duration_seconds} seconds.\n"
+        f"- Motion must be subtle and smooth — no rapid moves, no full 360 "
+        f"orbit, no shake.\n"
         f"- The product NEVER rotates or moves itself; only the camera moves "
         f"around it.\n"
-        f"- No rapid moves, no full 360 orbit, no shake.\n\n"
-        f"Decision rules — apply in order:\n"
-        f"1. If the photos clearly show interesting features on multiple sides "
-        f"(e.g. front + a distinctive back, or front + a detailed side), "
-        f"recommend a SLIGHT camera arc / partial orbit (30-90 degrees, no "
-        f"more) that reveals that second angle by the end of the clip. Name "
-        f"the feature being revealed (e.g. \"the carved backrest\", \"the "
-        f"upholstered side panel\").\n"
-        f"2. If the photos only show front / 3-quarter views, or the product "
-        f"is visually similar from every angle, recommend a simple PUSH-IN "
-        f"toward the product with very gentle parallax — no orbit.\n"
-        f"3. If the product is plain (cylindrical, symmetrical, low-detail), "
-        f"a slow push-in is fine.\n\n"
-        f"Output: ONLY 1-2 sentences describing the camera motion. No "
-        f"preamble, no caveats, no markdown. Begin directly with the motion. "
-        f"This sentence will be appended verbatim to a video-generation "
-        f"prompt.\n\n"
+        f"- Duration must be an integer between {DURATION_MIN_SECONDS} and "
+        f"{DURATION_MAX_SECONDS} seconds inclusive.\n\n"
+        f"Joint decision rules — apply in order:\n"
+        f"1. If the photos clearly show distinctive features on MULTIPLE "
+        f"sides (e.g. front + a carved back, front + a detailed side), "
+        f"recommend a SLIGHT camera arc / partial orbit (30–90°) that "
+        f"reveals that second angle by the end. Name the feature being "
+        f"revealed. Duration: 8–14s — long enough for the rotation to "
+        f"breathe without dragging.\n"
+        f"2. If the photos show MANY distinctive angles (e.g. a modular "
+        f"sofa with carved details on every face), recommend a longer arc "
+        f"(60–90°) and 14–20s.\n"
+        f"3. If the photos show only front / 3-quarter views, OR the "
+        f"product looks visually similar from every angle, recommend a "
+        f"simple PUSH-IN with very gentle parallax — no orbit. Duration: "
+        f"5–7s.\n"
+        f"4. If the product is plain (cylindrical, symmetrical, "
+        f"low-detail), a slow push-in at 5–6s is fine.\n\n"
+        f"Output: ONLY a single-line JSON object with exactly these two "
+        f"keys, no preamble, no markdown fences, no explanation:\n"
+        f'  {{"motion": "<1-2 sentences>", "duration": <integer {DURATION_MIN_SECONDS}-{DURATION_MAX_SECONDS}>}}\n\n'
         f"Good examples:\n"
-        f"- Slow push-in toward the front, then a gentle arc to the right "
-        f"during the last second to reveal the carved backrest.\n"
-        f"- Simple slow push-in with very gentle parallax. No orbit.\n"
-        f"- Subtle camera arc from front to 3/4 left over the duration of "
-        f"the clip, settling on a view of the upholstered armrest."
+        f'- {{"motion": "Slow push-in toward the front, then a gentle arc '
+        f'to the right during the last 2s to reveal the carved walnut '
+        f'backrest.", "duration": 12}}\n'
+        f'- {{"motion": "Simple slow push-in with very gentle parallax. '
+        f'No orbit.", "duration": 6}}\n'
+        f'- {{"motion": "Subtle camera arc from front to 3/4 left over the '
+        f'duration of the clip, settling on the upholstered armrest.", '
+        f'"duration": 10}}'
     )
 
     images = [_image_block(p) for p in selected]
 
     response = anthropic_client.messages.create(
         model=model,
-        max_tokens=200,
+        max_tokens=300,
         messages=[{
             "role": "user",
             "content": [{"type": "text", "text": prompt}, *images],
@@ -564,9 +775,7 @@ def _suggest_camera_motion(
         if getattr(block, "type", None) == "text":
             text = block.text
             break
-    # Strip any markdown / quote framing Claude might add despite the prompt.
-    cleaned = text.strip().strip("`").strip('"').strip()
-    return cleaned
+    return _parse_motion_response(text, fallback_duration)
 
 
 def _classify_image_type(local_path: str) -> str:
@@ -846,6 +1055,78 @@ def _extract_frame(video_path: str, *, when: str, out_path: str) -> None:
         )
 
 
+def _detect_leading_blank_seconds(
+    video_path: str,
+    *,
+    max_check_seconds: float = 2.0,
+    step_seconds: float = 0.2,
+    near_white_threshold: int = 240,
+    blank_fraction: float = 0.95,
+) -> float:
+    """Detect near-blank / near-white frames at the start of a video and
+    return the timestamp where actual content begins.
+
+    Google Veo occasionally generates a brief fade-in / pure-white intro
+    before the actual product content appears. Our title overlay then
+    sits on top of those white frames — looks like the video starts on
+    a white card with title text. This detector probes frames at
+    `step_seconds` intervals (default 200ms) up to `max_check_seconds`,
+    counts pixels that are near-white in each, and returns the timestamp
+    of the first frame where fewer than `blank_fraction` (default 95%)
+    of pixels are near-white.
+
+    Returns 0.0 if no leading blank intro is detected — most models
+    (Seedance, Kling) start with content immediately."""
+    duration = _probe_video_duration(video_path)
+    if duration <= step_seconds:
+        return 0.0
+
+    tmp_dir = _Path(video_path).parent
+    last_blank_t: float | None = None
+    t = 0.0
+    while t < min(max_check_seconds, duration - step_seconds):
+        # Extract one frame at time t. Use a low-res sample to keep this
+        # cheap — we only need pixel statistics, not the actual image.
+        probe_png = str(tmp_dir / f"_blank_probe_{int(t * 1000):04d}.png")
+        cmd = [
+            _ffmpeg_exe(), "-y", "-loglevel", "error",
+            "-ss", f"{t:.3f}", "-i", video_path,
+            "-frames:v", "1", "-vf", "scale=160:-1",  # downsample for speed
+            probe_png,
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0 or not os.path.isfile(probe_png):
+            # Probing failed — bail conservatively (no trim)
+            return last_blank_t or 0.0
+        with _PILImage.open(probe_png) as img:
+            arr = np.array(img.convert("RGB"))
+        os.remove(probe_png)
+        near_white = np.all(arr >= near_white_threshold, axis=-1).mean()
+        if float(near_white) < blank_fraction:
+            # Found a frame with real content
+            return last_blank_t if last_blank_t is not None else 0.0
+        last_blank_t = t + step_seconds
+        t += step_seconds
+    # Entire probed window was blank — trim everything we checked.
+    return last_blank_t or 0.0
+
+
+def _trim_video_start(video_path: str, trim_seconds: float, output_path: str) -> None:
+    """Drop `trim_seconds` from the start of `video_path` and write the
+    result to `output_path`. Re-encodes (since we usually don't land on
+    a keyframe), but at high quality so the loss is negligible. Preserves
+    audio if present."""
+    cmd = [
+        _ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-ss", f"{trim_seconds:.3f}", "-i", video_path,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "fast",
+    ]
+    if _has_audio_stream(video_path):
+        cmd += ["-c:a", "aac"]
+    cmd += [output_path]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 def _build_bookend_clip(
     *,
     still_frame_path: str,
@@ -1101,44 +1382,53 @@ def _run_replicate(
         composition consistent with the references — used by --add-background
         so the product can be placed into a new scene.
 
-    Model-specific knobs:
-      - Seedance 1.x → `camera_fixed`
-      - Seedance 2.0+ → `generate_audio`"""
-    is_v2 = _is_seedance_v2(model)
+    Per-model field names and accepted optional fields are looked up via
+    `_caps_for_model` — every model on Replicate accepts a different set,
+    and passing an unknown field 422s the call. Kling uses `start_image`
+    / `end_image` while Seedance uses `image` / `last_frame_image`; Veo
+    uses `image` + `last_frame`. `camera_fixed` is Seedance-1.x-only;
+    `generate_audio` is Seedance-2.0+ and Veo. Kling has no
+    `resolution` (the v2.1 variant uses a `mode` enum instead)."""
+    caps = _caps_for_model(model)
+    # Defensive: snap duration once more in case the caller didn't.
+    # Kling / Veo / Runway will 422 on a non-enum value otherwise.
+    effective_duration, _ = _coerce_duration_for_model(model, duration)
     open_files: list = []
     try:
         payload: dict = {
             "prompt": prompt,
-            "duration": duration,
-            "resolution": resolution,
-            "aspect_ratio": aspect_ratio,
+            "duration": effective_duration,
         }
-        if reference_paths:
-            if not is_v2:
-                raise RuntimeError(
-                    f"reference_images mode requires Seedance 2.0+; got {model!r}"
-                )
+        if caps["aspect_ratio"]:
+            payload["aspect_ratio"] = aspect_ratio
+        if caps["resolution"]:
+            payload["resolution"] = resolution
+        elif caps["kling_mode"]:
+            # Kling v2.1: `mode` field replaces `resolution`.
+            # standard ≈ 720p, pro ≈ 1080p.
+            payload["mode"] = "pro" if "1080" in resolution else "standard"
+        if caps["camera_fixed"]:
+            payload["camera_fixed"] = bool(camera_fixed)
+        if caps["generate_audio"]:
+            payload["generate_audio"] = bool(generate_audio)
+
+        if reference_paths and caps["reference_images_key"]:
             handles = []
             for p in reference_paths:
                 fh = open(p, "rb")
                 open_files.append(fh)
                 handles.append(fh)
-            payload["reference_images"] = handles
+            payload[caps["reference_images_key"]] = handles
         elif seed_photo_path:
             seed_fh = open(seed_photo_path, "rb")
             open_files.append(seed_fh)
-            payload["image"] = seed_fh
-            if last_frame_path:
+            payload[caps["first_frame_key"]] = seed_fh
+            if last_frame_path and caps["last_frame_key"]:
                 tail_fh = open(last_frame_path, "rb")
                 open_files.append(tail_fh)
-                payload["last_frame_image"] = tail_fh
+                payload[caps["last_frame_key"]] = tail_fh
         else:
             raise RuntimeError("no input photos supplied to _run_replicate")
-
-        if is_v2:
-            payload["generate_audio"] = bool(generate_audio)
-        else:
-            payload["camera_fixed"] = bool(camera_fixed)
 
         output = client.run(model, input=payload)
     finally:
@@ -1288,22 +1578,35 @@ def execute(
                 continue
 
             # Mode dispatch (per-SKU, from the plan's Background cell):
-            #   - reference: non-empty Background → Seedance 2.0+ only. Up to 9
-            #     photos for identity/style; image+last_frame_image are not used.
-            #   - keyframe: empty Background → first + optional last shot, letterboxed.
+            #   - "wants reference mode" = non-empty Background. Whether
+            #     it ACTUALLY runs in reference_images mode depends on the
+            #     model, decided in the retry loop below. Seedance 2.0+
+            #     gets the multi-image identity anchor; other models fall
+            #     back to single-keyframe + prompt-driven scene swap.
+            #   - empty Background → keyframe mode, no scene swap.
             sku_background = (plan.background or "").strip()
             sku_audio = (plan.audio or "").strip()
-            using_reference = bool(sku_background)
+            wants_reference = bool(sku_background)
             ref_local_paths: list[str] = []
+            ref_names: list[str] = []
             seed_local: str | None = None
             tail_local: str | None = None
             seed_name = tail_name = ""
 
             pool = _select_pool(downloaded, whitebg, user_curated=user_curated)
-            if using_reference:
+            if wants_reference:
                 refs = _pick_reference_images(pool, max_refs=max_reference_images)
                 ref_local_paths = [p for (_n, p) in refs]
                 ref_names = [n for (n, _p) in refs]
+                # Also prep a single keyframe so models that can't do
+                # reference_images (Kling, Veo, Runway, Seedance 1.x) can
+                # still run via start_image + prompt-driven scene swap.
+                if refs:
+                    seed_name, seed_raw = refs[0]
+                    seed_local = _letterbox_to_aspect(
+                        seed_raw, aspect_ratio,
+                        str(tmp_path / f"_lb_first_{seed_name}.jpg"),
+                    )
             else:
                 keyframes = _pick_keyframes(pool, use_two_frames=use_last_frame)
                 seed_name, seed_raw = keyframes[0]
@@ -1318,10 +1621,13 @@ def execute(
 
             logger(f"\n[{plan.sku}] → {out_name}")
             logger(f"  selection: {'user-curated from sheet' if user_curated else 'auto (white-bg classifier)'}")
-            if using_reference:
-                logger(f"  mode: reference_images ({len(ref_local_paths)} refs)")
-                logger(f"  refs: {', '.join(ref_names)}")
+            if wants_reference:
                 logger(f"  background: {sku_background}")
+                logger(
+                    f"  ref pool:   {len(ref_local_paths)} photos "
+                    f"({', '.join(ref_names)})"
+                )
+                logger(f"  fallback keyframe: {seed_name}")
             else:
                 logger("  mode: keyframe")
                 logger(f"  first frame: {seed_name}")
@@ -1336,6 +1642,13 @@ def execute(
             # prompt in the sheet for just that row.
             effective_default_prompt = (
                 plan.prompt_override.strip() or default_prompt
+            )
+
+            # Per-SKU duration. Falls back to the run-wide default if the
+            # plan field is somehow empty / unparseable; always clamped to
+            # the supported [DURATION_MIN_SECONDS, DURATION_MAX_SECONDS] band.
+            sku_duration = _clamp_duration(
+                plan.duration_seconds or duration, fallback=duration,
             )
 
             # Claude-driven camera motion analysis. Run only when:
@@ -1354,27 +1667,31 @@ def execute(
                 if motion_client:
                     motion_photo_paths = [p for (_n, p) in downloaded[:9]]
                     try:
-                        sku_camera_motion = _suggest_camera_motion(
+                        suggestion = _suggest_motion_and_duration(
                             motion_client,
                             parent_product=plan.parent_product,
                             photo_paths=motion_photo_paths,
-                            duration_seconds=duration,
+                            fallback_duration=sku_duration,
                             model=motion_model,
                         )
-                        logger(f"  Claude motion: {sku_camera_motion}")
+                        sku_camera_motion = suggestion.motion
+                        sku_duration = suggestion.duration
+                        logger(
+                            f"  Claude motion: {sku_camera_motion} "
+                            f"(duration={sku_duration}s)"
+                        )
                     except Exception as exc:
                         logger(f"  ⚠ motion analysis failed, using default: {exc}")
                         sku_camera_motion = ""
 
-            prompt = build_prompt(
-                plan.parent_product, effective_default_prompt, extra_prompt,
-                background=sku_background, audio=sku_audio,
-                reference_count=len(ref_local_paths),
-                camera_motion=sku_camera_motion,
-            )
-            logger(f"  prompt: {prompt}")
+            # NOTE: the seedance prompt is built INSIDE the retry loop
+            # (further down) because `reference_count` — which controls
+            # whether the prompt mentions `[Image1]…[ImageN]` — depends on
+            # whether THIS attempt's model will actually receive a
+            # reference_images array. Models that fall back to keyframe
+            # mode shouldn't see those tokens in their prompt.
             logger(
-                f"  duration={duration}s  resolution={resolution}  "
+                f"  duration={sku_duration}s  resolution={resolution}  "
                 f"aspect={aspect_ratio}  audio={'on' if sku_audio else 'off'}"
             )
 
@@ -1388,38 +1705,73 @@ def execute(
                 used_model = model
                 shot_start = time.time()
                 is_v2 = _is_seedance_v2(model)
-                if using_reference and not is_v2:
-                    yield GenProgress(
-                        sku=plan.sku, output_name=out_name, skipped=False,
-                        error=(
-                            f"Background={sku_background!r} requires a Seedance 2.0+ "
-                            f"model (got {model!r}). Clear the Background cell for this "
-                            "SKU or switch models."
-                        ),
-                    )
-                    break
+                # Audio output is Seedance 2.0+ exclusive (other models
+                # in our roster don't synthesize audio at all).
                 if sku_audio and not is_v2:
                     yield GenProgress(
                         sku=plan.sku, output_name=out_name, skipped=False,
                         error=(
                             f"Audio={sku_audio!r} requires a Seedance 2.0+ model "
-                            f"(got {model!r}); 1.x has no audio output. Clear the "
-                            "Audio cell for this SKU or switch models."
+                            f"(got {model!r}); 1.x / Kling / Veo / Runway have "
+                            "no audio output. Clear the Audio cell or switch models."
                         ),
                     )
                     break
+
+                # Pick the actual API mode for this attempt:
+                #   - wants_reference + Seedance 2.0+ → reference_images
+                #     (multi-photo identity anchor, no last_frame_image)
+                #   - wants_reference + non-v2 model  → keyframe fallback:
+                #     start_image = first reference photo, no last_frame
+                #     (the scene is described in the prompt; no identity
+                #     anchor beyond the single keyframe)
+                #   - !wants_reference                → keyframe mode
+                #     (start + optional last_frame for rotation)
+                use_ref_for_attempt = wants_reference and is_v2
+                attempt_seed = None if use_ref_for_attempt else seed_local
+                attempt_tail = None if (use_ref_for_attempt or wants_reference) else tail_local
+                attempt_refs = ref_local_paths if use_ref_for_attempt else None
+                mode_label = (
+                    "reference_images" if use_ref_for_attempt
+                    else ("keyframe-fallback (bg via prompt)" if wants_reference
+                          else "keyframe")
+                )
+
+                # Build the prompt for THIS attempt — reference_count
+                # mirrors the actual mode, so non-v2 keyframe attempts
+                # don't get phantom `[Image1]` tokens.
+                attempt_prompt = build_prompt(
+                    plan.parent_product, effective_default_prompt, extra_prompt,
+                    background=sku_background, audio=sku_audio,
+                    reference_count=len(attempt_refs) if attempt_refs else 0,
+                    camera_motion=sku_camera_motion,
+                )
+
+                # Snap duration to the model's accepted set. Kling/Veo/
+                # Runway have strict enums; passing 10s to Veo (enum
+                # {4,6,8}) would 422.
+                attempt_duration, dur_was_coerced = _coerce_duration_for_model(
+                    model, sku_duration,
+                )
+
                 try:
                     if client is None:
                         client = _replicate_client()
-                    logger(f"  attempt {attempt}: model={model}")
+                    logger(f"  attempt {attempt}: model={model}  mode={mode_label}")
+                    if dur_was_coerced:
+                        logger(
+                            f"  duration: {sku_duration}s → {attempt_duration}s "
+                            f"(snapped to {model}'s accepted set)"
+                        )
+                    logger(f"  prompt: {attempt_prompt}")
                     video_bytes = _run_replicate(
                         client,
                         model=model,
-                        seed_photo_path=seed_local,
-                        last_frame_path=tail_local,
-                        reference_paths=ref_local_paths or None,
-                        prompt=prompt,
-                        duration=duration,
+                        seed_photo_path=attempt_seed,
+                        last_frame_path=attempt_tail,
+                        reference_paths=attempt_refs,
+                        prompt=attempt_prompt,
+                        duration=attempt_duration,
                         resolution=resolution,
                         aspect_ratio=aspect_ratio,
                         camera_fixed=camera_fixed,
@@ -1445,6 +1797,28 @@ def execute(
             seedance_path = str(tmp_path / f"_seedance_{out_name}")
             with open(seedance_path, "wb") as fh:
                 fh.write(video_bytes)
+
+            # Trim leading near-white intro frames if the model added any
+            # (Veo sometimes does this — a brief fade-in / pure-white
+            # intro before content kicks in). Without this, the title
+            # overlay below would sit on top of those white frames,
+            # producing a "white card with title" intro that looks wrong.
+            # The original raw output stays on disk for --debug upload
+            # so the user can inspect what came back from the API.
+            try:
+                trim_secs = _detect_leading_blank_seconds(seedance_path)
+                if trim_secs > 0.05:
+                    trimmed_path = str(tmp_path / f"_seedance_trimmed_{out_name}")
+                    _trim_video_start(seedance_path, trim_secs, trimmed_path)
+                    logger(
+                        f"  trimmed {trim_secs:.2f}s of leading near-white intro "
+                        f"frames (likely a model fade-in)"
+                    )
+                    seedance_path = trimmed_path
+            except Exception as exc:
+                # Conservative: if probing fails for any reason, leave
+                # the raw output alone rather than silently dropping data.
+                logger(f"  [warn] leading-blank probe failed; using raw output: {exc}")
 
             # Title / logo bookend cards. Either, both, or neither — the
             # final upload path is whatever came out the other end of the
@@ -1539,10 +1913,14 @@ def execute(
                 try:
                     debug_folder_id = drive.find_or_create_folder("_debug", videos_folder_id)
                     artifacts = [
-                        # Raw Seedance output — the most useful one: lets you
-                        # see what came back from the API before ffmpeg touched it.
+                        # Raw model output — lets you see what came back
+                        # from the API before any ffmpeg processing.
                         (str(tmp_path / f"_seedance_{out_name}"),
                          f"{plan.sku}_seedance.mp4", "video/mp4"),
+                        # Same clip after the leading-blank-frames trim
+                        # (only exists if a model fade-in was detected).
+                        (str(tmp_path / f"_seedance_trimmed_{out_name}"),
+                         f"{plan.sku}_seedance_trimmed.mp4", "video/mp4"),
                         # Overlay PNGs (transparent canvases).
                         (str(tmp_path / "_title_overlay.png"),
                          "_title.png", "image/png"),

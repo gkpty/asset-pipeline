@@ -54,8 +54,16 @@ def build_plan(
 ) -> tuple[list[DedupePlan], list[str]]:
     """Read the diagnose report and produce a list of DELETE/MERGE actions.
 
-    For each duplicate row (isDuplicate=TRUE) with a Suggested Action of DELETE or MERGE,
-    we resolve which Drive folder is the duplicate (vs the primary) and queue the action.
+    Two row classes are processed:
+
+      - **Duplicates** (isDuplicate=TRUE): need a primary folder to be
+        chosen so DELETE knows which copy to keep and MERGE knows where
+        to copy unique files into.
+
+      - **Orphan / single-folder rows** (isDuplicate≠TRUE) with an
+        explicit Suggested Action: DELETE trashes the folder unconditionally
+        (no primary needed). MERGE is rejected for these rows since
+        there's no primary to merge into.
     """
     locations = _collect_locations(root_folder_id, structure)
 
@@ -77,8 +85,6 @@ def build_plan(
     warnings: list[str] = []
 
     for row in report_rows:
-        if str(row.get("isDuplicate", "")).strip().upper() != "TRUE":
-            continue
         action = str(row.get("Suggested Action", "")).strip().upper()
         if action not in ("DELETE", "MERGE"):
             continue
@@ -88,24 +94,50 @@ def build_plan(
         if not sku:
             continue
 
-        pool = dup_pool.get(sku, [])
-        # Match by supplier first; if multiple match (rare: two dups in same supplier), take in order.
-        match_idx = next(
-            (i for i, (sup, _) in enumerate(pool) if sup == supplier),
-            None,
-        )
-        if match_idx is None:
-            warnings.append(
-                f"No duplicate folder found in Drive for {supplier}/{sku} (already cleaned up?)"
-            )
-            continue
+        is_duplicate = str(row.get("isDuplicate", "")).strip().upper() == "TRUE"
 
-        sup, dup_id = pool.pop(match_idx)
-        primary_sup, primary_id = primary_by_sku[sku]
-        plans.append(DedupePlan(
-            sku=sku, supplier=sup, primary_supplier=primary_sup,
-            action=action, dup_folder_id=dup_id, primary_folder_id=primary_id,
-        ))
+        if is_duplicate:
+            # Existing branch: find which folder is the duplicate to act on.
+            pool = dup_pool.get(sku, [])
+            # Match by supplier first; if multiple match (rare: two dups in same supplier), take in order.
+            match_idx = next(
+                (i for i, (sup, _) in enumerate(pool) if sup == supplier),
+                None,
+            )
+            if match_idx is None:
+                warnings.append(
+                    f"No duplicate folder found in Drive for {supplier}/{sku} (already cleaned up?)"
+                )
+                continue
+            sup, dup_id = pool.pop(match_idx)
+            primary_sup, primary_id = primary_by_sku[sku]
+            plans.append(DedupePlan(
+                sku=sku, supplier=sup, primary_supplier=primary_sup,
+                action=action, dup_folder_id=dup_id, primary_folder_id=primary_id,
+            ))
+        else:
+            # Orphan-style row (or any single-folder row the user marked
+            # for action). MERGE makes no sense without a primary.
+            if action == "MERGE":
+                warnings.append(
+                    f"Skipping MERGE on non-duplicate row {supplier}/{sku} "
+                    "— MERGE needs a primary folder; clear the cell or set DELETE."
+                )
+                continue
+            fids = locations.get((supplier, sku), [])
+            if not fids:
+                warnings.append(
+                    f"No Drive folder found for {supplier}/{sku} (already deleted?)"
+                )
+                continue
+            # Single-folder case (the typical orphan). If somehow there are
+            # multiple, the duplicate branch should've caught them — but
+            # defensively pick the first.
+            dup_id = fids[0]
+            plans.append(DedupePlan(
+                sku=sku, supplier=supplier, primary_supplier="",
+                action="DELETE", dup_folder_id=dup_id, primary_folder_id="",
+            ))
 
     return plans, warnings
 

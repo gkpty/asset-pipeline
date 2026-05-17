@@ -47,6 +47,16 @@ _TOKEN_COVERAGE_CUTOFF = 0.7         # weighted-token-overlap fraction
 _TOKEN_COVERAGE_CUTOFF_SUPPLIER = 0.45
 _MIN_TOKEN_LEN = 3                   # ignore tokens shorter than this
 
+# OS-generated junk that's typically dropped alongside real assets when
+# folders are zipped/copied from Windows or NAS shares. macOS dotfiles
+# (.DS_Store, ._FILE) are already covered by the `.`-prefix filter.
+_JUNK_FILENAMES = {
+    "Thumbs.db",
+    "ehthumbs.db",
+    "desktop.ini",
+    "Desktop.ini",
+}
+
 
 def resolve_type_subdir(asset_type: str, paths: InputPaths) -> str:
     """Map a --type value (e.g. 'photo' or 'lifestyle_photos') to a relative drive subdir."""
@@ -93,9 +103,22 @@ def _tokens(s: str) -> set[str]:
 
 
 def _walk_files(input_dir: Path) -> Iterable[Path]:
+    """Recursively yield real asset files from `input_dir`.
+
+    Filters out:
+      - Dotfiles (`.DS_Store`, `._FILE`, etc.)
+      - OS-generated junk by name (`Thumbs.db`, `desktop.ini`, ...)
+    Folder names are preserved in the relative path so the matcher can
+    use them via _haystack — nested layouts like
+    `S5-5/PRODUCT/VARIANT/1.jpg` work without any caller changes."""
     for p in input_dir.rglob("*"):
-        if p.is_file() and not p.name.startswith("."):
-            yield p
+        if not p.is_file():
+            continue
+        if p.name.startswith("."):
+            continue
+        if p.name in _JUNK_FILENAMES:
+            continue
+        yield p
 
 
 def _haystack(path: Path, input_dir: Path) -> tuple[str, set[str]]:
@@ -278,6 +301,31 @@ def _identify(
     if c := _longest_substring_match(norm_path, candidates, "norm_name"):
         return c, "HIGH", f"Path contains product name '{c.name}'"
 
+    # 1b. 100% token coverage on supplier ref / product name (HIGH).
+    # Promotes cases where the candidate's discriminating tokens all appear
+    # in the path but special characters / interspersed words break the
+    # contiguous-substring check above. Common when folder names like
+    # "712#MOON-4(2A)-EP251" carry a supplier ref "712#-4(2A)-EP251" whose
+    # alphanumeric tokens are present in order but not contiguously.
+    ref_full_c, ref_full_cov, ref_full_hit = _best_token_coverage(
+        path_tokens, candidates, "tok_ref", 0.9999, min_tokens=1,
+    )
+    if ref_full_c and ref_full_cov >= 0.9999:
+        hit = ", ".join(sorted(ref_full_hit))
+        return ref_full_c, "HIGH", (
+            f"Path fully covers supplier ref tokens of "
+            f"'{ref_full_c.supplier_ref}' ({hit})"
+        )
+    name_full_c, name_full_cov, name_full_hit = _best_token_coverage(
+        path_tokens, candidates, "tok_name", 0.9999, min_tokens=2,
+    )
+    if name_full_c and name_full_cov >= 0.9999:
+        hit = ", ".join(sorted(name_full_hit))
+        return name_full_c, "HIGH", (
+            f"Path fully covers product name tokens of "
+            f"'{name_full_c.name}' ({hit})"
+        )
+
     # 2. Token coverage on path — partial match against name / supplier ref (MEDIUM)
     name_c, name_cov, name_hit = _best_token_coverage(
         path_tokens, candidates, "tok_name", coverage_cutoff, min_tokens=2,
@@ -401,7 +449,12 @@ class UploadProgress(NamedTuple):
     sku: str
     file_index: int
     file_total: int
-    skipped: bool   # True when the file already existed at the destination
+    skipped: bool   # True when the upload didn't happen for any reason
+    # Short tag explaining why a skip happened (empty on successful uploads):
+    #   "local missing"   — input_dir/rel_path doesn't exist on disk
+    #   "no sku folder"   — Drive folder for this SKU doesn't exist
+    #   "already exists"  — destination already has a file with this name
+    skip_reason: str = ""
 
 
 def _guess_mime(path: Path) -> str:
@@ -442,10 +495,16 @@ def execute_copy(
 
         local_path = input_dir / rel_path
         if not local_path.is_file():
-            yield UploadProgress(rel_path, sku, i, total, skipped=True)
+            yield UploadProgress(
+                rel_path, sku, i, total,
+                skipped=True, skip_reason="local missing",
+            )
             continue
         if sku not in sku_folders:
-            yield UploadProgress(rel_path, sku, i, total, skipped=True)
+            yield UploadProgress(
+                rel_path, sku, i, total,
+                skipped=True, skip_reason="no sku folder",
+            )
             continue
 
         if sku not in dest_cache:
@@ -457,7 +516,10 @@ def execute_copy(
 
         dest_id, existing = dest_cache[sku]
         if local_path.name in existing:
-            yield UploadProgress(rel_path, sku, i, total, skipped=True)
+            yield UploadProgress(
+                rel_path, sku, i, total,
+                skipped=True, skip_reason="already exists",
+            )
             continue
 
         drive.upload_file(str(local_path), dest_id, local_path.name, _guess_mime(local_path))

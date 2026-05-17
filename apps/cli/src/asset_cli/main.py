@@ -560,22 +560,36 @@ def upload_local_files(
         MofNCompleteColumn(),
         console=console,
     )
+    # Tally skip reasons so the user can diagnose at-a-glance instead of
+    # scrolling back through the per-row bar updates.
+    skip_breakdown: dict[str, int] = {}
     with upload_bar:
         bar_task = upload_bar.add_task("Uploading…", total=actionable, completed=0)
         for p in execute_copy(report_rows, input_dir, subdir, category_folder_id, cfg.structure_for(category)):
-            label = "skipped" if p.skipped else "uploaded"
+            if p.skipped:
+                label = f"[yellow]skipped[/yellow] [dim]({p.skip_reason})[/dim]"
+                skip_breakdown[p.skip_reason] = skip_breakdown.get(p.skip_reason, 0) + 1
+                skipped += 1
+            else:
+                label = "[green]uploaded[/green]"
+                uploaded += 1
             upload_bar.update(
                 bar_task,
                 description=f"{label}: [bold]{p.rel_path}[/bold] → {p.sku}",
                 advance=1,
             )
-            if p.skipped:
-                skipped += 1
-            else:
-                uploaded += 1
 
     console.print()
     console.print(f"[bold]Upload complete[/bold]  ({uploaded} uploaded, {skipped} skipped)")
+    if skip_breakdown:
+        console.print("[bold]Skip reasons:[/bold]")
+        for reason, n in sorted(skip_breakdown.items(), key=lambda kv: -kv[1]):
+            hint = {
+                "local missing":  "report row points at a file that's gone from --input dir",
+                "no sku folder":  "SKU isn't scaffolded on Drive yet (run `asset scaffold`)",
+                "already exists": "destination file with this name is already there (re-run is idempotent)",
+            }.get(reason, "")
+            console.print(f"  [yellow]•[/yellow] {reason:15s} {n:>4}  [dim]{hint}[/dim]")
 
 
 @app.command("rename")
@@ -707,11 +721,17 @@ def dedupe(
     ),
 ) -> None:
     """
-    Read the Diagnose Report and act on duplicate rows according to the
-    'Suggested Action' column. DELETE trashes the duplicate folder.
-    MERGE copies any unique files into the primary (preserving subfolder
-    structure) before trashing the duplicate. Trashed items are recoverable
-    from Drive's bin.
+    Read the Diagnose Report and act on rows according to the 'Suggested
+    Action' column.
+
+      - DELETE on a duplicate row → trashes the duplicate folder.
+      - DELETE on a non-duplicate row (typically an orphan dir not in the
+        master sheet) → trashes that folder unconditionally.
+      - MERGE on a duplicate row → copies any unique files into the primary
+        (preserving subfolder structure) before trashing the duplicate.
+        MERGE on a non-duplicate row is rejected (no primary to merge into).
+
+    Trashed items are recoverable from Drive's bin.
     """
     from rich.table import Table
 
@@ -741,20 +761,25 @@ def dedupe(
     if plans:
         table = Table(title=f"Planned dedupe actions ({len(plans)})")
         table.add_column("Action", style="bold")
-        table.add_column("Duplicate")
-        table.add_column("Duplicate ID", style="dim")
+        table.add_column("Folder")
+        table.add_column("Folder ID", style="dim")
         table.add_column("→")
         table.add_column("Primary")
         table.add_column("Primary ID", style="dim")
         for p in plans:
+            is_orphan = not p.primary_folder_id
             colour = "red" if p.action == "DELETE" else "yellow"
+            label = (
+                f"DELETE [dim](orphan)[/dim]"
+                if (p.action == "DELETE" and is_orphan) else p.action
+            )
             table.add_row(
-                f"[{colour}]{p.action}[/{colour}]",
+                f"[{colour}]{label}[/{colour}]",
                 f"{p.supplier}/{p.sku}",
                 p.dup_folder_id,
-                "→",
-                f"{p.primary_supplier}/{p.sku}",
-                p.primary_folder_id,
+                "" if is_orphan else "→",
+                "" if is_orphan else f"{p.primary_supplier}/{p.sku}",
+                "" if is_orphan else p.primary_folder_id,
             )
         console.print(table)
     else:
@@ -763,12 +788,15 @@ def dedupe(
     for w in warnings:
         console.print(f"[yellow]⚠[/yellow] {w}")
 
-    delete_n = sum(1 for p in plans if p.action == "DELETE")
-    merge_n  = sum(1 for p in plans if p.action == "MERGE")
+    delete_dup_n    = sum(1 for p in plans if p.action == "DELETE" and p.primary_folder_id)
+    delete_orphan_n = sum(1 for p in plans if p.action == "DELETE" and not p.primary_folder_id)
+    merge_n         = sum(1 for p in plans if p.action == "MERGE")
 
     if not execute:
         console.print(
-            f"\n[bold]Dry run complete[/bold] — {delete_n} delete, {merge_n} merge."
+            f"\n[bold]Dry run complete[/bold] — "
+            f"{delete_dup_n} duplicate delete(s), {delete_orphan_n} orphan delete(s), "
+            f"{merge_n} merge(s)."
             + (" Pass --execute to apply." if plans else "")
         )
         return
@@ -801,7 +829,8 @@ def dedupe(
 
     console.print(
         f"\n[bold]Dedupe complete[/bold] — "
-        f"{delete_n} deleted, {merge_n} merged ({total_copied} files copied during merges). "
+        f"{delete_dup_n} duplicate(s) deleted, {delete_orphan_n} orphan(s) deleted, "
+        f"{merge_n} merged ({total_copied} files copied during merges). "
         f"Re-run diagnose to refresh the report."
     )
 
@@ -978,6 +1007,13 @@ def generate(
         help="Limit to a single SKU. Filters both the dry-run report and the execute set. "
              "Useful for spot-testing one row before running the full batch.",
     ),
+    supplier_filter: Optional[str] = typer.Option(
+        None, "--supplier",
+        help="Limit to a single supplier (case-insensitive match on the Supplier "
+             "column). Filters both the dry-run report and the execute set. "
+             "Useful for processing all of one supplier's products at once. "
+             "Combines with --sku (both must match) and --action.",
+    ),
     action_filter: Optional[str] = typer.Option(
         None, "--action",
         help="(--type photos) Limit to a single action: 'copy' or 'generate'. "
@@ -1132,12 +1168,19 @@ def generate(
         action_filter_norm = af.upper()
 
     sku_filter_norm: Optional[str] = (sku_filter.strip() if sku_filter else None) or None
+    # Supplier filter is case-insensitive — the master sheet and Drive
+    # listings can have inconsistent casing on supplier names.
+    supplier_filter_norm: Optional[str] = (
+        supplier_filter.strip().lower() if supplier_filter else None
+    ) or None
 
     def _apply_filters(plans_list):
-        """Filter a plan list by --sku / --action. No-op if neither flag set."""
+        """Filter a plan list by --sku / --supplier / --action. No-op if none set."""
         out = plans_list
         if sku_filter_norm is not None:
             out = [p for p in out if p.sku == sku_filter_norm]
+        if supplier_filter_norm is not None:
+            out = [p for p in out if (p.supplier or "").lower() == supplier_filter_norm]
         if action_filter_norm is not None:
             out = [p for p in out if p.action == action_filter_norm]
         return out
@@ -1237,9 +1280,14 @@ def generate(
             progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
             progress.stop_task(t)
 
-        # Apply --sku / --action filters to the report rows before execute.
+        # Apply --sku / --supplier / --action filters to the report rows before execute.
         if sku_filter_norm:
             report_rows = [r for r in report_rows if (r.get("SKU") or "").strip() == sku_filter_norm]
+        if supplier_filter_norm:
+            report_rows = [
+                r for r in report_rows
+                if (r.get("Supplier") or "").strip().lower() == supplier_filter_norm
+            ]
         if action_filter_norm:
             report_rows = [
                 r for r in report_rows
@@ -1345,9 +1393,10 @@ def generate(
                 cost_per_image_usd=_cost_per,
                 part_col=cfg.csv.part_column,
                 size_col=cfg.csv.size_column,
-                # Push --sku into build_plan so we don't waste hundreds of Drive
-                # calls on SKUs we're going to filter out anyway.
+                # Push --sku / --supplier into build_plan so we don't waste
+                # hundreds of Drive calls on SKUs we're going to filter out anyway.
                 sku_filter=sku_filter_norm,
+                supplier_filter=supplier_filter_norm,
             )
             progress.update(t, description=f"Built plan: {len(plans)} entries")
             progress.stop_task(t)
@@ -1523,19 +1572,26 @@ def generate(
         _audio_on = bool(add_audio) or bool(audio_text)
         _audio_text = (audio_text or video_cfg.default_audio).strip() if _audio_on else ""
 
-        # Both features need Seedance 2.0+. Fail fast before any Drive/Sheets work.
+        # Audio output is Seedance 2.0+ exclusive — fail fast.
         any_v2 = any(m.strip().lower().startswith("bytedance/seedance-2") for m in _models)
-        if (_bg_text or _audio_text) and not any_v2:
-            offenders = []
-            if _bg_text:
-                offenders.append(f"--background ({_bg_text!r})")
-            if _audio_text:
-                offenders.append("--add-audio / --audio")
+        if _audio_text and not any_v2:
             raise typer.BadParameter(
-                f"{', '.join(offenders)} require a Seedance 2.0+ model. "
-                f"Configured: {_models}. Set --models bytedance/seedance-2.0, "
-                "update generate.video.models in pipeline.config.toml, or pass "
-                "--background '' to disable scene replacement for this run."
+                f"--add-audio / --audio require a Seedance 2.0+ model "
+                f"(1.x / Kling / Veo / Runway have no audio output here). "
+                f"Configured: {_models}. Set --models bytedance/seedance-2.0 "
+                "or update generate.video.models in pipeline.config.toml."
+            )
+        # Background is supported on every model, but only Seedance 2.0+
+        # gets the reference_images identity anchor. Other models fall
+        # back to single-keyframe-plus-prompt — flag the trade-off so the
+        # user knows what they're paying for.
+        if _bg_text and not any_v2:
+            console.print(
+                f"[yellow]heads up:[/yellow] --background with "
+                f"{', '.join(_models)} will use single-keyframe + prompt-driven "
+                "scene swap (no reference_images identity anchor since that's "
+                "Seedance 2.0+ only). Identity fidelity may be lower for "
+                "complex products — A/B against Seedance 2.0 if quality matters."
             )
 
         # Resolve --add-logo-card / --logo-id (the text-override pattern).
@@ -1593,15 +1649,29 @@ def generate(
                 default_background=_bg_text,
                 default_audio=_audio_text,
                 default_prompt=video_cfg.default_prompt,
+                default_duration=video_cfg.duration_seconds,
                 sku_filter=sku_filter_norm,
+                supplier_filter=supplier_filter_norm,
             )
             progress.update(t, description=f"Built plan: {len(plans)} entries")
             progress.stop_task(t)
 
-        # Only --sku applies to video plans; --action has no meaning (one action).
+        # --action has no meaning for video plans (one action); --sku
+        # and --supplier still apply.
+        before = len(plans)
         if sku_filter_norm:
             plans = [p for p in plans if p.sku == sku_filter_norm]
-            console.print(f"[dim]Filtered to {len(plans)} entries (sku={sku_filter_norm!r})[/dim]")
+        if supplier_filter_norm:
+            plans = [p for p in plans if (p.supplier or "").lower() == supplier_filter_norm]
+        if sku_filter_norm or supplier_filter_norm:
+            bits = []
+            if sku_filter_norm:
+                bits.append(f"sku={sku_filter_norm!r}")
+            if supplier_filter_norm:
+                bits.append(f"supplier={supplier_filter_norm!r}")
+            console.print(
+                f"[dim]Filtered {before} → {len(plans)} entries ({', '.join(bits)})[/dim]"
+            )
 
         counts = sum_video(plans)
 
@@ -1621,7 +1691,7 @@ def generate(
                     category_folder_id=category_folder_id,
                     structure=structure,
                     photos_subdir=photos_subdir,
-                    duration_seconds=video_cfg.duration_seconds,
+                    fallback_duration=video_cfg.duration_seconds,
                     default_prompt=video_cfg.default_prompt,
                     logger=console.print,
                 )
@@ -1672,6 +1742,9 @@ def generate(
                 f"\n                    suggestion when --analyze-motion is passed. Edit"
                 f"\n                    per-row to refine; your text replaces the default"
                 f"\n                    for that SKU. Clear the cell to fall back."
+                f"\n  • Duration      → clip length in seconds (5-20). Pre-filled with"
+                f"\n                    the configured default; --analyze-motion rewrites"
+                f"\n                    it per-SKU (more rotation = longer clip)."
                 f"\nThen re-run with --execute (and --budget to set a hard cost cap)."
             )
             return
@@ -1717,6 +1790,17 @@ def generate(
                 p.title = (r.get("Title") or "").strip()
             if "Prompt" in r:
                 p.prompt_override = (r.get("Prompt") or "").strip()
+            # Duration cell — parse + clamp to [5, 20]. Empty cell leaves
+            # the build_plan default in place.
+            if "Duration" in r:
+                raw_dur = (r.get("Duration") or "").strip()
+                if raw_dur:
+                    try:
+                        d = int(round(float(raw_dur)))
+                        p.duration_seconds = max(5, min(20, d))
+                    except ValueError:
+                        # Garbage in the cell — keep the build_plan default.
+                        pass
         runnable = [p for p in plans if p.action == "GENERATE" and p.sku in actionable_skus]
 
         runnable_worst_cost = round(len(runnable) * _worst_per_video, 4)
@@ -1758,6 +1842,16 @@ def generate(
         with_bg = sum(1 for p in runnable if p.background.strip())
         with_audio = sum(1 for p in runnable if p.audio.strip())
         with_title = sum(1 for p in runnable if (p.title or "").strip()) if add_title_card else 0
+        # Per-SKU durations span a range now; surface min / max so the user
+        # sees the spread instead of a single number that hides variation.
+        durations = sorted(p.duration_seconds for p in runnable if p.duration_seconds)
+        if durations:
+            dmin, dmax = durations[0], durations[-1]
+            duration_label = (
+                f"seedance={dmin}s" if dmin == dmax else f"seedance={dmin}-{dmax}s"
+            )
+        else:
+            duration_label = f"seedance={video_cfg.duration_seconds}s"
         # Final clip length is seedance duration + any bookend overlays we'll
         # prepend / append; surface it so the user sees what they'll get.
         bookend_seconds = (
@@ -1776,7 +1870,7 @@ def generate(
             f"[bold]Running[/bold] {len(runnable)} video generations "
             f"(~${runnable_best_cost:.2f}–${runnable_worst_cost:.2f}, "
             f"models={' → '.join(_models)}, retries={_max_retries}, "
-            f"seedance={video_cfg.duration_seconds}s → final={total_seconds:.1f}s "
+            f"{duration_label} (+ bookends → ~{total_seconds:.1f}s final) "
             f"@ {video_cfg.resolution}, "
             f"bg-rows={with_bg}/{len(runnable)}, audio-rows={with_audio}/{len(runnable)}"
             f"{', ' + ', '.join(cards_label) if cards_label else ''})."
@@ -1890,9 +1984,14 @@ def generate(
         progress.update(t, description=f"Read {len(report_rows)} rows from '{_report_tab}'")
         progress.stop_task(t)
 
-    # Apply --sku / --action filters to the report rows before execute.
+    # Apply --sku / --supplier / --action filters to the report rows before execute.
     if sku_filter_norm:
         report_rows = [r for r in report_rows if (r.get("SKU") or "").strip() == sku_filter_norm]
+    if supplier_filter_norm:
+        report_rows = [
+            r for r in report_rows
+            if (r.get("Supplier") or "").strip().lower() == supplier_filter_norm
+        ]
     if action_filter_norm:
         report_rows = [
             r for r in report_rows
@@ -2095,6 +2194,165 @@ def _optimize_models(
     console.print(
         f"\n[bold]Model optimization complete[/bold]  "
         f"({completed} optimized, {errored} errored)"
+    )
+
+
+@app.command("refine-photos")
+def refine_photos(
+    sku: str = typer.Option(
+        ..., "--sku",
+        help="SKU whose photos folder to refine. Photos are expected to live at "
+             "<category>/<supplier>/<sku>/<product_photos>/ (or <category>/<sku>/... "
+             "for flat categories).",
+    ),
+    reference: Optional[str] = typer.Option(
+        None, "--reference",
+        help="Filename (e.g. '3.jpg') of the photo that already has the correct "
+             "fabric color — this is the source of the LAB color statistics. "
+             "Required unless --restore is used.",
+    ),
+    restore: bool = typer.Option(
+        False, "--restore",
+        help="Don't run the transfer — instead, roll back a previous --debug run "
+             "by promoting every `_pre_refine_<name>.jpg` in <photos>/_debug/ "
+             "back to its original name (trashing the refined version). Use this "
+             "if a refine run produced bad output.",
+    ),
+    apply_to: Optional[str] = typer.Option(
+        None, "--apply-to",
+        help="Comma-separated filenames to refine. Default: every photo in the "
+             "folder except the reference. Useful when only some of the AI "
+             "outputs need fixing.",
+    ),
+    config_path: Path = typer.Option(
+        Path("pipeline.config.toml"),
+        envvar="PIPELINE_CONFIG_PATH",
+        help="Path to pipeline.config.toml.",
+    ),
+    root_folder_id: str = typer.Option(
+        ..., envvar="GOOGLE_DRIVE_ROOT_FOLDER_ID",
+        help="Google Drive parent folder ID (contains category subfolders).",
+    ),
+    category: str = typer.Option(
+        "products", "--category",
+        help="Subfolder under the parent root (default: products).",
+    ),
+    mask_white_bg: bool = typer.Option(
+        True, "--mask-white-bg/--no-mask-white-bg",
+        help="When on (default), the per-channel STATS are computed from "
+             "non-near-white pixels only (keeps backdrop noise out of the "
+             "fabric stats). The transform itself is always applied globally "
+             "— near-white backdrop pixels pick up the reference's color cast. "
+             "Disable when the photos don't have a white studio backdrop.",
+    ),
+    white_threshold: int = typer.Option(
+        250, "--white-threshold",
+        help="RGB threshold above which a pixel counts as white-backdrop and "
+             "is excluded from STATS (0-255). Default 250 keeps ivory / cream "
+             "fabrics in the fabric region; drop to ~245 only for fabrics "
+             "darker than typical near-white.",
+    ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help="Preserve originals as <photos>/_debug/_pre_refine_<name>.jpg before "
+             "overwriting. Without --debug, originals just go to Drive trash "
+             "(recoverable for ~30 days).",
+    ),
+) -> None:
+    """
+    Fix fabric color on AI-generated product photos using Reinhard LAB color
+    transfer. Useful when an `asset generate --type photos` run produced N
+    photos but only one came out with the correct fabric tone — point this
+    command at the correct one as `--reference` and the others are re-tinted
+    to match. No API calls, no cost, ~50ms per photo.
+
+    Reads photos from <category>/<supplier?>/<sku>/<product_photos>/, applies
+    the transfer, and overwrites in place. With `--mask-white-bg` (default)
+    the studio backdrop is preserved verbatim — only the product / fabric
+    region gets the color shift.
+    """
+    from asset_sdk.adapters import drive
+    from asset_sdk.config import PipelineConfig
+    from asset_sdk.stages.refine_photos import execute as run_refine, restore_from_debug
+
+    cfg = PipelineConfig.load(config_path)
+    category_folder_id = drive.resolve_category_folder(root_folder_id, category)
+    structure = cfg.structure_for(category)
+
+    # Build a {sku → folder_id} map across the category, accounting for the
+    # optional supplier intermediate level.
+    if structure == "flat":
+        sku_folders = drive.list_folders(category_folder_id)
+    else:
+        sku_folders = {}
+        for sup_id in drive.list_folders(category_folder_id).values():
+            sku_folders.update(drive.list_folders(sup_id))
+
+    if sku not in sku_folders:
+        raise typer.BadParameter(
+            f"SKU folder not found in Drive for {category}/{sku}. "
+            f"Run `asset scaffold` or check the SKU spelling."
+        )
+
+    if restore:
+        console.print(
+            f"[bold]Restoring[/bold] {sku} photos from --debug originals "
+            f"in <photos>/_debug/…"
+        )
+        n = restore_from_debug(
+            sku_folder_id=sku_folders[sku],
+            photos_subdir=cfg.paths.product_photos,
+            logger=console.print,
+        )
+        console.print(f"\n[bold]Restore complete[/bold]  ({n} file(s) restored)")
+        return
+
+    if not reference:
+        raise typer.BadParameter(
+            "--reference is required unless --restore is passed."
+        )
+
+    target_list: Optional[list[str]] = None
+    if apply_to:
+        target_list = [n.strip() for n in apply_to.split(",") if n.strip()]
+
+    console.print(
+        f"[bold]Refining[/bold] {sku} photos against [bold]{reference}[/bold] "
+        f"(mask_white_bg={mask_white_bg}, threshold={white_threshold}, "
+        f"debug={debug})…"
+    )
+
+    refined = errored = skipped = 0
+    for prog in run_refine(
+        sku_folder_id=sku_folders[sku],
+        photos_subdir=cfg.paths.product_photos,
+        reference_name=reference,
+        target_names=target_list,
+        mask_white_bg=mask_white_bg,
+        white_threshold=white_threshold,
+        debug=debug,
+        logger=console.print,
+    ):
+        if prog.error:
+            console.print(
+                f"  [{'yellow' if prog.skipped else 'red'}]"
+                f"{'skip' if prog.skipped else 'err'}[/] "
+                f"{prog.target_name}: {prog.error}"
+            )
+            if prog.skipped:
+                skipped += 1
+            else:
+                errored += 1
+        else:
+            console.print(
+                f"  [green]✓[/green] {prog.target_name}  "
+                f"({prog.file_index}/{prog.file_total})"
+            )
+            refined += 1
+
+    console.print(
+        f"\n[bold]Refine complete[/bold]  "
+        f"({refined} refined, {skipped} skipped, {errored} errored)"
     )
 
 

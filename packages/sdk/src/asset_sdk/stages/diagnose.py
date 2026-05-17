@@ -337,9 +337,16 @@ def run(
                 suggestion = matches[0]
 
         issues = _append_root_notes("Not in sheet", loose, unknown)
+        # Pure orphans (no rename hint) get auto-suggested DELETE so the
+        # dedupe command can clean them up without manual editing. Orphans
+        # with a rename hint stay empty — they belong to the `rename`
+        # command, which would otherwise be pre-empted. Either way the
+        # user can clear / change the cell in Sheets before --execute.
+        primary_action = "" if suggestion else "DELETE"
         rows.append(SkuRow(
             sku=sku, supplier=primary_sup, status="ORPHAN DIR",
-            is_duplicate=False, suggested_rename=suggestion, suggested_action="",
+            is_duplicate=False, suggested_rename=suggestion,
+            suggested_action=primary_action,
             issues=issues, dir_counts=counts,
             loose_file_count=loose, unknown_folder_count=unknown,
         ))

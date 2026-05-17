@@ -154,6 +154,7 @@ def build_plan(
     part_col: str = "",
     size_col: str = "",
     sku_filter: str | None = None,
+    supplier_filter: str | None = None,
 ) -> list[PhotoPlan]:
     """One PhotoPlan per SKU in the sheet.
 
@@ -229,6 +230,7 @@ def build_plan(
         return material_cache[key]
 
     plans: list[PhotoPlan] = []
+    sup_filter_lower = supplier_filter.strip().lower() if supplier_filter else None
 
     for row in sheet_rows:
         sku = (row.get(sku_col) or "").strip()
@@ -239,10 +241,15 @@ def build_plan(
         if not sku:
             continue
 
-        # Early-skip when --sku is set: avoids expensive per-SKU Drive lookups
-        # for the 590+ SKUs we're not interested in. Sibling lookup for the
-        # filtered SKU still works because group_to_skus was built from all rows.
+        # Early-skip when --sku / --supplier is set: avoids expensive
+        # per-SKU Drive lookups for the SKUs we're not interested in.
+        # Sibling lookup for the surviving SKU still works because
+        # group_to_skus was built from all rows (siblings can be in a
+        # different supplier — we treat the filter as a TARGET filter,
+        # not a sibling-pool filter).
         if sku_filter is not None and sku != sku_filter:
+            continue
+        if sup_filter_lower is not None and sup.lower() != sup_filter_lower:
             continue
 
         target_materials = {col: (row.get(col) or "").strip() for col in material_columns}
